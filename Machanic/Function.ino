@@ -21,6 +21,21 @@ const uint8_t DIR2_PINS[NUM_ACTUATORS] = {
   43, 48, 49, 50, 51, 52, 53
 };
 
+// TB6600 步进电机（新增第 15 路执行器，不占 PWM）。
+// 说明：原有 14 路已占用 D51~D53，因此避免冲突，使用 A0-A2（D54-D56）。
+// 若仍想用 D51/D52/D53，需要把对应杆的 DIR2 线移到其他空闲脚。
+const uint8_t STEPPER_STEP_PIN = 54;  // A0
+const uint8_t STEPPER_DIR_PIN  = 55;  // A1
+const uint8_t STEPPER_ENA_PIN  = 56;  // A2，可选未接
+
+// 步进脉冲节奏：100us 翻转一次 = 200Hz STEP
+const unsigned long STEPPER_PULSE_INTERVAL_US = 100;
+
+bool stepperRunning = false;
+bool stepperLeft = true;  // true = 左（DIR 低），false = 右（DIR 高）
+unsigned long lastStepperToggleUs = 0;
+bool stepperStepLevel = LOW;
+
 // R_EN 和 L_EN 在测试阶段直接接 5V，仍然保留管脚以便后续改为 Arduino 控制。
 const uint8_t REN_PIN = 46;
 const uint8_t LEN_PIN = 47;
@@ -47,6 +62,27 @@ uint8_t cmdIndex = 0;
 void setDirection(uint8_t idx, bool forward) {
   digitalWrite(DIR1_PINS[idx], forward ? HIGH : LOW);
   digitalWrite(DIR2_PINS[idx], forward ? LOW : HIGH);
+}
+
+// === TB6600 步进控制（非阻塞方波脉冲） ===
+void enableStepper(bool enable) {
+  // 若 ENA 未接，这里保持低电平也无副作用。
+  digitalWrite(STEPPER_ENA_PIN, enable ? LOW : HIGH);  // TB6600: ENA- 低 = 使能
+}
+
+void stopStepper() {
+  stepperRunning = false;
+  stepperStepLevel = LOW;
+  digitalWrite(STEPPER_STEP_PIN, LOW);
+}
+
+void startStepper(bool toLeft) {
+  stepperLeft = toLeft;
+  digitalWrite(STEPPER_DIR_PIN, stepperLeft ? LOW : HIGH);  // 约定 LOW=左, HIGH=右
+  stepperStepLevel = LOW;
+  digitalWrite(STEPPER_STEP_PIN, LOW);
+  stepperRunning = true;
+  lastStepperToggleUs = micros();
 }
 
 void moveForward(uint8_t idx, int speed) {
@@ -162,7 +198,8 @@ void applyHighLevel(char c) {
       for (uint8_t i = 6; i < NUM_ACTUATORS; i++) {
         stopMotor(i);
       }
-      Serial.println("Cmd A: 1-2 F@200, 3-6 B@100, 7-14 stop");
+      startStepper(true);  // 左转
+      Serial.println("Cmd A: 1-2 F@200, 3-6 B@100, 7-14 stop + Stepper LEFT");
       break;
     case 'B':
       moveBackward(0, 200);
@@ -174,11 +211,13 @@ void applyHighLevel(char c) {
       for (uint8_t i = 6; i < NUM_ACTUATORS; i++) {
         stopMotor(i);
       }
-      Serial.println("Cmd B: 1-2 B@200, 3-6 F@100, 7-14 stop");
+      startStepper(false);  // 右转
+      Serial.println("Cmd B: 1-2 B@200, 3-6 F@100, 7-14 stop + Stepper RIGHT");
       break;
     case 'S':
     default:
       stopAll();
+      stopStepper();
       Serial.println("Cmd S: all stop");
       break;
   }
@@ -245,10 +284,17 @@ void setup() {
   pinMode(LEN_PIN, OUTPUT);
   flushEnablePins();
 
+  pinMode(STEPPER_STEP_PIN, OUTPUT);
+  pinMode(STEPPER_DIR_PIN, OUTPUT);
+  pinMode(STEPPER_ENA_PIN, OUTPUT);
+  enableStepper(true);
+  stopStepper();
+
   Serial.println("=== 14-Actuator Controller Ready ===");
   Serial.println("High-level: A / B / S");
   Serial.println("Low-level: A<id>,<F|B|S>[,<0-255>]  e.g. A3,F,180");
   Serial.println("Broadcast: ALL,<F|B|S>[,<0-255>]  e.g. ALL,S");
+  Serial.println("Stepper: A=LEFT, B=RIGHT, S=STOP (TB6600)");
 
   // 启动默认流程：先前伸 20s，再后缩 10s（若收到指令则打断）
   defaultStage = STAGE_FWD;
@@ -286,6 +332,16 @@ void loop() {
         // 缓冲区溢出保护，丢弃并重置
         cmdIndex = 0;
       }
+    }
+  }
+
+  // 步进电机脉冲生成（非阻塞）
+  if (stepperRunning) {
+    unsigned long nowUs = micros();
+    if (nowUs - lastStepperToggleUs >= STEPPER_PULSE_INTERVAL_US) {
+      lastStepperToggleUs = nowUs;
+      stepperStepLevel = !stepperStepLevel;
+      digitalWrite(STEPPER_STEP_PIN, stepperStepLevel);
     }
   }
 
