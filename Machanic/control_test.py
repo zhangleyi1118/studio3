@@ -37,8 +37,8 @@ def connect_arduino():
     selected_port = ports[port_index].device
     
     try:
-        # 连接Arduino (波特率9600)
-        ser = serial.Serial(selected_port, 9600, timeout=1)
+        # 连接Arduino (波特率 115200)
+        ser = serial.Serial(selected_port, 115200, timeout=1)
         print(f"\n✓ 已连接到 {selected_port}")
         print("等待Arduino初始化...")
         time.sleep(2)  # 等待Arduino重启
@@ -68,9 +68,9 @@ def main():
     
     print("\n" + "=" * 50)
     print("控制指令:")
-    print("  f = 向前伸展 (Forward)")
-    print("  b = 向后收缩 (Backward)")
-    print("  s = 停止 (Stop)")
+    print("  a = 高层命令A：1-2前伸200；3-6后缩100；7-14停")
+    print("  b = 高层命令B：1-2后缩200；3-6前伸100；7-14停")
+    print("  s = 全部停止")
     print("  q = 退出程序 (Quit)")
     print("=" * 50)
     
@@ -83,7 +83,7 @@ def main():
                     print(f"Arduino: {msg}")
             
             # 获取用户输入
-            command = input("\n输入指令 (f/b/s/q): ").strip().lower()
+            command = input("\n输入指令 (a/b/s/q): ").strip().lower()
             
             if command == 'q':
                 print("\n正在退出...")
@@ -91,18 +91,18 @@ def main():
                 time.sleep(0.1)
                 break
             
-            elif command in ['f', 'b', 's']:
-                # 发送指令到Arduino
-                ser.write(command.encode())
+            elif command in ['a', 'b', 's']:
+                # 发送高层指令到Arduino（加换行便于解析）
+                ser.write((command + "\n").encode())
                 print(f"✓ 已发送指令: {command.upper()}")
-                time.sleep(0.1)  # 短暂延迟，等待Arduino响应
+                time.sleep(0.05)  # 短暂延迟，等待Arduino响应
                 
             else:
                 print("⚠ 无效指令，请输入 f/b/s/q")
     
     except KeyboardInterrupt:
         print("\n\n检测到 Ctrl+C，正在退出...")
-        ser.write(b's')  # 确保停止电机
+        ser.write(b's\n')  # 确保停止电机
         time.sleep(0.1)
     
     finally:
