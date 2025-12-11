@@ -1,24 +1,46 @@
-// === 引脚定义（适配单电桥 L298 逻辑：1 PWM 速度脚 + 2 方向脚/每根杆） ===
+// === 引脚定义（BTS7960 双H桥驱动：2个PWM + 2个使能/每根杆） ===
+// BTS7960 正确工作逻辑（实测验证）：
+//   ✅ R_EN和L_EN都保持HIGH（两个使能都开启）
+//   正转：RPWM=PWM, LPWM=0
+//   反转：RPWM=0, LPWM=PWM
+//   停止：RPWM=0, LPWM=0
+//   ⚠️ 禁止：RPWM和LPWM同时有PWM信号（会短路烧毁！）
+//   ⚠️ 注意：如果EN互斥使用会导致电机两端电压差消失，无法产生扭矩
+//
 // 物理接法（每根杆）：
-//   IN1 → DIR1_PINS[i]，IN2 → DIR2_PINS[i]，IN3 → SPEED_PINS[i] (PWM)，IN4 → GND（常接地，简化为自由停）
-// Mega2560 的 PWM 脚：2-13, 44-46（共 15 个）。这里为 14 根杆各占 1 个 PWM 速度脚。
+//   R_EN → R_EN_PINS[i]（右侧使能，正转时=HIGH）
+//   L_EN → L_EN_PINS[i]（左侧使能，反转时=HIGH）
+//   RPWM → RPWM_PINS[i]（右侧PWM，正转速度控制）
+//   LPWM → LPWM_PINS[i]（左侧PWM，反转速度控制）
+//
+// 分组方案（因Mega2560 PWM引脚有限）：
+//   组1（杆1-2）：RPWM=D2, LPWM=D3
+//   组2（杆3-6）：RPWM=D4, LPWM=D5
+//   组3（杆7-14）：RPWM=D6, LPWM=D7
 const uint8_t NUM_ACTUATORS = 14;
 
-// 速度脚（需 PWM）
-const uint8_t SPEED_PINS[NUM_ACTUATORS] = {
-  2, 3, 4, 5, 6, 7, 8,
-  9, 10, 11, 12, 13, 44, 45
+// RPWM引脚（正转PWM，分组共用）
+const uint8_t RPWM_PINS[NUM_ACTUATORS] = {
+  2, 2, 4, 4, 4, 4, 6,      // 杆1-2用D2, 杆3-6用D4, 杆7用D6
+  6, 6, 6, 6, 6, 6, 6       // 杆8-14用D6
 };
 
-// 方向脚对（普通数字脚）：DIR1 高 / DIR2 低 = 前伸；DIR1 低 / DIR2 高 = 后缩
-const uint8_t DIR1_PINS[NUM_ACTUATORS] = {
-  22, 23, 24, 25, 26, 27, 28,
-  29, 30, 31, 32, 33, 34, 35
+// LPWM引脚（反转PWM，分组共用）
+const uint8_t LPWM_PINS[NUM_ACTUATORS] = {
+  3, 3, 5, 5, 5, 5, 7,      // 杆1-2用D3, 杆3-6用D5, 杆7用D7
+  7, 7, 7, 7, 7, 7, 7       // 杆8-14用D7
 };
 
-const uint8_t DIR2_PINS[NUM_ACTUATORS] = {
-  36, 37, 38, 39, 40, 41, 42,
-  43, 48, 49, 50, 51, 52, 53
+// R_EN引脚（右侧使能，普通数字脚）
+const uint8_t R_EN_PINS[NUM_ACTUATORS] = {
+  22, 24, 26, 28, 30, 32, 34,
+  36, 38, 40, 42, 46, 48, 50
+};
+
+// L_EN引脚（左侧使能，普通数字脚）
+const uint8_t L_EN_PINS[NUM_ACTUATORS] = {
+  23, 25, 27, 29, 31, 33, 35,
+  37, 39, 41, 43, 47, 49, 51
 };
 
 // TB6600 步进电机（新增第 15 路执行器，不占 PWM）。
@@ -28,17 +50,16 @@ const uint8_t STEPPER_STEP_PIN = 54;  // A0
 const uint8_t STEPPER_DIR_PIN  = 55;  // A1
 const uint8_t STEPPER_ENA_PIN  = 56;  // A2，可选未接
 
-// 步进脉冲节奏：100us 翻转一次 = 200Hz STEP
-const unsigned long STEPPER_PULSE_INTERVAL_US = 100;
+// 步进电机速度：0-600 RPM
+// 600 RPM = 10转/秒，假设200步/转 = 2000步/秒
+// 脉冲翻转间隔 = 1/(2000步/秒 × 2次翻转/步) = 250us
+// 可调范围：83us (最快1800RPM) ~ 500us (最慢300RPM)
+const unsigned long STEPPER_PULSE_INTERVAL_US = 500;  // 300 RPM
 
 bool stepperRunning = false;
 bool stepperLeft = true;  // true = 左（DIR 低），false = 右（DIR 高）
 unsigned long lastStepperToggleUs = 0;
 bool stepperStepLevel = LOW;
-
-// R_EN 和 L_EN 在测试阶段直接接 5V，仍然保留管脚以便后续改为 Arduino 控制。
-const uint8_t REN_PIN = 46;
-const uint8_t LEN_PIN = 47;
 
 const int DEFAULT_SPEED = 200;  // 0-255
 
@@ -47,21 +68,16 @@ struct ParsedCommand;
 bool parseCommand(const String &line, ParsedCommand &out);
 void applyCommand(const ParsedCommand &cmd);
 
-// 启动默认流程：先前伸 20s，再后缩 10s（速度 200），若收到指令则终止默认流程
-enum DefaultStage { STAGE_FWD, STAGE_BACK, STAGE_DONE };
-DefaultStage defaultStage = STAGE_FWD;
-unsigned long defaultStageStartMs = 0;
-bool defaultActive = true;
-
 // 串口命令缓冲区
 const uint8_t CMD_BUFFER_SIZE = 40;
 char cmdBuffer[CMD_BUFFER_SIZE];
 uint8_t cmdIndex = 0;
 
-// === 基础动作（方向脚对: HIGH/LOW = 前伸，LOW/HIGH = 后缩） ===
-void setDirection(uint8_t idx, bool forward) {
-  digitalWrite(DIR1_PINS[idx], forward ? HIGH : LOW);
-  digitalWrite(DIR2_PINS[idx], forward ? LOW : HIGH);
+// === 基础动作（BTS7960控制：R_EN/L_EN都保持HIGH，只用RPWM/LPWM控制方向） ===
+// BTS7960正确用法：两个使能都HIGH，方向由PWM控制
+void enableMotor(uint8_t idx) {
+  digitalWrite(R_EN_PINS[idx], HIGH);
+  digitalWrite(L_EN_PINS[idx], HIGH);
 }
 
 // === TB6600 步进控制（非阻塞方波脉冲） ===
@@ -76,27 +92,39 @@ void stopStepper() {
   digitalWrite(STEPPER_STEP_PIN, LOW);
 }
 
-void startStepper(bool toLeft) {
-  stepperLeft = toLeft;
-  digitalWrite(STEPPER_DIR_PIN, stepperLeft ? LOW : HIGH);  // 约定 LOW=左, HIGH=右
-  stepperStepLevel = LOW;
-  digitalWrite(STEPPER_STEP_PIN, LOW);
+void startStepper(bool left) {
+  stepperLeft = left;
+  digitalWrite(STEPPER_DIR_PIN, left ? LOW : HIGH);
   stepperRunning = true;
+  stepperStepLevel = LOW;
   lastStepperToggleUs = micros();
 }
 
 void moveForward(uint8_t idx, int speed) {
-  setDirection(idx, true);
-  analogWrite(SPEED_PINS[idx], speed);
+  // BTS7960正确用法：R_EN/L_EN都HIGH，方向由PWM控制
+  digitalWrite(R_EN_PINS[idx], HIGH);
+  digitalWrite(L_EN_PINS[idx], HIGH);
+  // 正转：RPWM=PWM, LPWM=0（确保互补，避免短路）
+  analogWrite(RPWM_PINS[idx], speed);
+  analogWrite(LPWM_PINS[idx], 0);
 }
 
 void moveBackward(uint8_t idx, int speed) {
-  setDirection(idx, false);
-  analogWrite(SPEED_PINS[idx], speed);
+  // BTS7960正确用法：R_EN/L_EN都HIGH，方向由PWM控制
+  digitalWrite(R_EN_PINS[idx], HIGH);
+  digitalWrite(L_EN_PINS[idx], HIGH);
+  // 反转：RPWM=0, LPWM=PWM（确保互补，避免短路）
+  analogWrite(RPWM_PINS[idx], 0);
+  analogWrite(LPWM_PINS[idx], speed);
 }
 
 void stopMotor(uint8_t idx) {
-  analogWrite(SPEED_PINS[idx], 0);
+  // 停止：保持EN=HIGH，PWM都归零（惯性滑行）
+  // 或者都LOW完全关闭（主动刹车）
+  digitalWrite(R_EN_PINS[idx], HIGH);
+  digitalWrite(L_EN_PINS[idx], HIGH);
+  analogWrite(RPWM_PINS[idx], 0);
+  analogWrite(LPWM_PINS[idx], 0);
 }
 
 void stopAll() {
@@ -122,7 +150,8 @@ void moveAllBackward(int speed) {
 //   'A' : 1-2 前伸@200；3-6 后缩@100；7-14 保持停止
 //   'B' : 与 A 相反
 //   'S' : 全部停止
-// 低层命令（保留原有精细控制，便于后续扩展）：A<id>,<F|B|S>[,<0-255>] 或 ALL,<F|B|S>[,<0-255>]
+// 低层命令（保留原有精细控制，便于后续扩展）：<id>,<F|B|S>[,<0-255>] 或 ALL,<F|B|S>[,<0-255>]
+// 示例：1,F,255  (1号电机前进255速度)  或  ALL,S  (全部停止)
 
 struct ParsedCommand {
   bool isHighLevel;   // true 表示单字母高层命令
@@ -264,25 +293,17 @@ void applyCommand(const ParsedCommand &cmd) {
   }
 }
 
-void flushEnablePins() {
-  // 测试阶段接 5V，这里保持高电平，后期如果不再直连可直接用这两个管脚。
-  digitalWrite(REN_PIN, HIGH);
-  digitalWrite(LEN_PIN, HIGH);
-}
-
 void setup() {
   Serial.begin(115200);
 
+  // 初始化所有电机控制引脚
   for (uint8_t i = 0; i < NUM_ACTUATORS; i++) {
-    pinMode(SPEED_PINS[i], OUTPUT);
-    pinMode(DIR1_PINS[i], OUTPUT);
-    pinMode(DIR2_PINS[i], OUTPUT);
-    stopMotor(i);
+    pinMode(R_EN_PINS[i], OUTPUT);
+    pinMode(L_EN_PINS[i], OUTPUT);
+    pinMode(RPWM_PINS[i], OUTPUT);
+    pinMode(LPWM_PINS[i], OUTPUT);
+    stopMotor(i);  // 初始化为安全停止状态
   }
-
-  pinMode(REN_PIN, OUTPUT);
-  pinMode(LEN_PIN, OUTPUT);
-  flushEnablePins();
 
   pinMode(STEPPER_STEP_PIN, OUTPUT);
   pinMode(STEPPER_DIR_PIN, OUTPUT);
@@ -290,16 +311,13 @@ void setup() {
   enableStepper(true);
   stopStepper();
 
-  Serial.println("=== 14-Actuator Controller Ready ===");
+  Serial.println("=== 14-Actuator BTS7960 Controller Ready ===");
   Serial.println("High-level: A / B / S");
-  Serial.println("Low-level: A<id>,<F|B|S>[,<0-255>]  e.g. A3,F,180");
+  Serial.println("Low-level: <id>,<F|B|S>[,<0-255>]  e.g. 3,F,180");
   Serial.println("Broadcast: ALL,<F|B|S>[,<0-255>]  e.g. ALL,S");
   Serial.println("Stepper: A=LEFT, B=RIGHT, S=STOP (TB6600)");
-
-  // 启动默认流程：先前伸 20s，再后缩 10s（若收到指令则打断）
-  defaultStage = STAGE_FWD;
-  defaultStageStartMs = millis();
-  moveAllForward(200);
+  Serial.println("Driver: BTS7960 Double H-Bridge");
+  Serial.println("Ready to receive commands...");
 }
 
 void loop() {
@@ -318,11 +336,9 @@ void loop() {
 
       ParsedCommand cmd;
       if (parseCommand(line, cmd)) {
-        // 收到指令后终止默认流程
-        defaultActive = false;
         applyCommand(cmd);
       } else {
-        Serial.print("Invalid cmd: ");
+        Serial.print("Invalid command: ");
         Serial.println(line);
       }
     } else {
@@ -342,32 +358,6 @@ void loop() {
       lastStepperToggleUs = nowUs;
       stepperStepLevel = !stepperStepLevel;
       digitalWrite(STEPPER_STEP_PIN, stepperStepLevel);
-    }
-  }
-
-  // 默认流程的非阻塞调度
-  if (defaultActive) {
-    unsigned long elapsed = millis() - defaultStageStartMs;
-    switch (defaultStage) {
-      case STAGE_FWD:
-        if (elapsed >= 20000UL) {  // 20s
-          defaultStage = STAGE_BACK;
-          defaultStageStartMs = millis();
-          moveAllBackward(200);
-          Serial.println("Default: switch to backward @200");
-        }
-        break;
-      case STAGE_BACK:
-        if (elapsed >= 10000UL) {  // 10s
-          defaultStage = STAGE_DONE;
-          defaultActive = false;
-          stopAll();
-          Serial.println("Default: done, all stopped");
-        }
-        break;
-      case STAGE_DONE:
-      default:
-        break;
     }
   }
 }
