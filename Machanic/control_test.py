@@ -95,7 +95,15 @@ def main():
                 # 发送高层指令到Arduino（加换行便于解析）
                 ser.write((command + "\n").encode())
                 print(f"✓ 已发送指令: {command.upper()}")
-                time.sleep(0.05)  # 短暂延迟，等待Arduino响应
+                time.sleep(0.2)  # 等待Arduino响应
+                
+                # 立即读取Arduino返回
+                response_count = 0
+                while ser.in_waiting and response_count < 10:
+                    msg = ser.readline().decode('utf-8', errors='ignore').strip()
+                    if msg:
+                        print(f"  ← Arduino: {msg}")
+                        response_count += 1
                 
             else:
                 print("⚠ 无效指令，请输入 f/b/s/q")
