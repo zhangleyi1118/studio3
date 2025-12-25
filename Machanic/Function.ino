@@ -706,7 +706,7 @@ void applyCommand(const ParsedCommand &cmd) {
 }
 
 // === 初始状态恢复（非阻塞） ===
-void resetToInitialState(bool actuators, bool stepper, bool servo) {
+void resetToInitialState(bool actuators, bool stepper, bool resetServo) {
   if (actuators) {
     // 伸缩杆：前进到最底（20cm，约33.3秒）
     moveGroupForward(1, 255);
@@ -740,7 +740,7 @@ void resetToInitialState(bool actuators, bool stepper, bool servo) {
     systemState.initStepper = false;
   }
   
-  if (servo) {
+  if (resetServo) {
     // 舵机：转到0度（立即完成）
     servo.write(0);
     systemState.servo.isRunning = false;
@@ -750,7 +750,7 @@ void resetToInitialState(bool actuators, bool stepper, bool servo) {
     systemState.initServo = false;
   }
   
-  if (!actuators && !stepper && !servo) {
+  if (!actuators && !stepper && !resetServo) {
     systemState.initState = INIT_IDLE;
   }
 }
