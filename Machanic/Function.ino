@@ -61,11 +61,6 @@ long stepperPosition = 0;  // 位置跟踪（右为正，左为负）
 
 // === 舵机对象 ===
 Servo servo;
-int currentServoAngle = 0;  // 当前角度（物理角度，0-180）
-int targetServoAngle = 0;   // 目标角度
-bool servoAngleKnown = false;  // 角度是否已知（上电时为false）
-const unsigned long SERVO_UPDATE_INTERVAL_MS = 100;  // 每100ms更新一次（10°/s = 100ms/度）
-unsigned long lastServoUpdateMs = 0;
 
 // === 状态管理系统 ===
 struct MotionState {
@@ -273,72 +268,12 @@ void setServoAngle(int targetAngle, int percent) {
   // 按百分比计算实际角度（转不到底没关系）
   int actualAngle = (targetAngle * percent) / 100;
   actualAngle = constrain(actualAngle, 0, 180);
-  
-  // 如果角度未知（第一次执行），立即设置到目标角度作为已知的起始点
-  if (!servoAngleKnown) {
-    currentServoAngle = actualAngle;
-    servo.write(currentServoAngle);
-    servoAngleKnown = true;
-    targetServoAngle = actualAngle;
-    systemState.servo.isRunning = false;
-    Serial.print("Servo initialized to: ");
-    Serial.print(actualAngle);
-    Serial.println(" degrees (position now known)");
-    return;
-  }
-  
-  // 设置目标角度，开始逐步运动
-  targetServoAngle = actualAngle;
-  lastServoUpdateMs = millis();
+  servo.write(actualAngle);
   
   systemState.servo.isRunning = true;
   systemState.servo.startTime = millis();
   systemState.servo.duration = calculateDuration(percent);
   systemState.servo.percent = percent;
-  
-  Serial.print("Servo target: ");
-  Serial.print(actualAngle);
-  Serial.print(" degrees (from ");
-  Serial.print(currentServoAngle);
-  Serial.println(" degrees)");
-}
-
-void updateServoPosition() {
-  if (!systemState.servo.isRunning) {
-    return;
-  }
-  
-  unsigned long now = millis();
-  
-  // 检查是否到达目标角度
-  if (currentServoAngle == targetServoAngle) {
-    systemState.servo.isRunning = false;
-    return;
-  }
-  
-  // 检查是否超时
-  if (now - systemState.servo.startTime >= systemState.servo.duration) {
-    // 时间到了，直接设置到目标角度
-    currentServoAngle = targetServoAngle;
-    servo.write(currentServoAngle);
-    systemState.servo.isRunning = false;
-    Serial.print("Servo reached target: ");
-    Serial.println(currentServoAngle);
-    return;
-  }
-  
-  // 按速度逐步更新角度（10°/s = 100ms/度）
-  if (now - lastServoUpdateMs >= SERVO_UPDATE_INTERVAL_MS) {
-    lastServoUpdateMs = now;
-    
-    if (currentServoAngle < targetServoAngle) {
-      currentServoAngle++;
-      servo.write(currentServoAngle);
-    } else if (currentServoAngle > targetServoAngle) {
-      currentServoAngle--;
-      servo.write(currentServoAngle);
-    }
-  }
 }
 
 // === 主工作模式状态机 ===
@@ -526,8 +461,9 @@ void executeDebugCommand(const ParsedCommand &cmd) {
   }
   
   if (cmd.isServo || cmd.isAll) {
-    // 舵机不需要方向判断，直接执行
-    setServoAngle(cmd.servoTargetAngle, cmd.debugPercent);
+    if (cmd.debugDirection != 'S') {
+      setServoAngle(cmd.servoTargetAngle, cmd.debugPercent);
+    }
   }
   
   Serial.print("Debug command executed: ");
@@ -686,30 +622,32 @@ bool parseCommand(const String &line, ParsedCommand &out) {
   int comma1 = rest.indexOf(',');
   if (comma1 < 0) return false;
   
-  // 对于舵机，格式是 SERVO,<百分比>（固定180度基准）
+  String dirPart = rest.substring(1, comma1);
+  dirPart.trim();
+  String percentPart = rest.substring(comma1 + 1);
+  percentPart.trim();
+  
+  char dir = dirPart.length() > 0 ? dirPart[0] : 'S';
+  int percent = percentPart.length() > 0 ? percentPart.toInt() : 0;
+  percent = constrain(percent, 0, 100);
+  
+  out.debugDirection = dir;
+  out.debugPercent = percent;
+  
+  // 对于舵机，解析角度（格式：SERVO,180,50）
   if (out.isServo) {
-    // 跳过第一个逗号，直接解析百分比
-    String percentStr = rest.substring(1);  // 跳过第一个逗号
-    percentStr.trim();
-    
-    out.debugPercent = percentStr.toInt();
-    out.debugPercent = constrain(out.debugPercent, 0, 100);
-    out.servoTargetAngle = 180;  // 固定使用180度作为基准
-    out.debugDirection = 'F';  // 舵机不需要方向，设为F避免被过滤
+    int angleComma = percentPart.indexOf(',');
+    if (angleComma > 0) {
+      String angleStr = percentPart.substring(0, angleComma);
+      String percentStr2 = percentPart.substring(angleComma + 1);
+      out.servoTargetAngle = angleStr.toInt();
+      out.debugPercent = percentStr2.toInt();
+      out.debugPercent = constrain(out.debugPercent, 0, 100);
+    } else {
+      out.servoTargetAngle = 180;  // 默认180度
+    }
   } else {
-    // 其他组件：解析方向和百分比
-    String dirPart = rest.substring(1, comma1);
-    dirPart.trim();
-    String percentPart = rest.substring(comma1 + 1);
-    percentPart.trim();
-    
-    char dir = dirPart.length() > 0 ? dirPart[0] : 'S';
-    int percent = percentPart.length() > 0 ? percentPart.toInt() : 0;
-    percent = constrain(percent, 0, 100);
-    
-    out.debugDirection = dir;
-    out.debugPercent = percent;
-    out.servoTargetAngle = 180;  // 非舵机组件不需要角度
+    out.servoTargetAngle = 180;
   }
   
   return true;
@@ -803,24 +741,11 @@ void resetToInitialState(bool actuators, bool stepper, bool resetServo) {
   }
   
   if (resetServo) {
-    // 舵机：转到物理0度（逐步运动）
-    // 如果角度未知，先立即设置到0度作为已知的起始点
-    if (!servoAngleKnown) {
-      currentServoAngle = 0;
-      servo.write(0);
-      servoAngleKnown = true;
-      Serial.println("Servo initialized to 0 degrees (position now known)");
-    } else {
-      // 角度已知，开始逐步运动到0度
-      targetServoAngle = 0;
-      lastServoUpdateMs = millis();
-      systemState.servo.isRunning = true;
-      systemState.servo.startTime = millis();
-      systemState.servo.duration = calculateDuration(100);  // 使用100%时间
-      systemState.servo.percent = 100;
-      Serial.println("Servo resetting to 0 degrees");
-    }
+    // 舵机：转到0度（立即完成）
+    servo.write(0);
+    systemState.servo.isRunning = false;
     systemState.initServo = true;
+    Serial.println("Servo set to 0 degrees");
   } else {
     systemState.initServo = false;
   }
@@ -931,11 +856,7 @@ void setup() {
   
   // 初始化舵机
   servo.attach(SERVO_PIN);
-  // 上电时角度未知，不执行任何动作，保持当前位置
-  currentServoAngle = 0;  // 软件记录，实际物理位置未知
-  targetServoAngle = 0;
-  servoAngleKnown = false;  // 标记为未知状态
-  // 不执行 servo.write()，避免立即跳转
+  servo.write(0);
   
   // 初始化系统状态
   systemState.mainState = IDLE;
@@ -947,7 +868,7 @@ void setup() {
   Serial.println("=== Multi-Component Synchronized Control System ===");
   Serial.println("Main mode: f,<percent> or b,<percent>  (e.g. f,20)");
   Serial.println("Debug mode: GROUP1/GROUP2/STEPPER/SERVO,<dir>,<percent>");
-  Serial.println("  Examples: GROUP1,F,20  STEPPER,L,30  SERVO,50");
+  Serial.println("  Examples: GROUP1,F,20  STEPPER,L,30  SERVO,180,50");
   Serial.println("  Combined: GROUP1+STEPPER,F,20");
   Serial.println("Initial state: START,ACTUATORS/STEPPER/SERVO/ALL");
   Serial.println("  Examples: START,ACTUATORS  START,ALL  START,ACTUATORS+SERVO");
@@ -955,7 +876,7 @@ void setup() {
   Serial.println("Ready to receive commands...");
   
   // 上电后不自动执行任何动作，只设置初始值
-  // 舵机角度保持未知状态，不执行任何动作
+  servo.write(0);  // 舵机角度设为0（不运动）
   stepperPosition = 0;  // 步进电机位置计数器重置为0（不实际移动）
 }
 
@@ -997,9 +918,6 @@ void loop() {
   
   // 更新步进电机位置跟踪
   updateStepperPosition();
-  
-  // 更新舵机位置（逐步运动）
-  updateServoPosition();
   
   // 更新控制间隙状态
   unsigned long now = millis();
