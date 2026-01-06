@@ -1,20 +1,21 @@
 /*
  * LED灯带控制系统 - ESP32版本
  * 
- * ⚠️ 重要提示：ESP32 RMT通道限制
- * ESP32只有8个RMT通道，但本系统需要控制14根灯带。
+ * 分组方案：14根灯带分为5组，同组灯带共用GPIO（硬件并联）
+ * - 组1：灯带1-4 → GPIO 2（虚拟位置7-14）
+ * - 组2：灯带5 → GPIO 13（虚拟位置1）
+ * - 组3：灯带6 → GPIO 14（虚拟位置20）
+ * - 组4：灯带7-10 → GPIO 15（虚拟位置15-19）
+ * - 组5：灯带11-14 → GPIO 26（虚拟位置2-6）
  * 
- * 解决方案：
- * 1. 确保使用FastLED库版本 3.5.0 或更高
- * 2. FastLED 3.5+会自动使用I2S驱动来支持超过8个通道
- * 3. 如果遇到"no free tx channels"错误，请升级FastLED库：
- *    - Arduino IDE: 工具 → 管理库 → 搜索"FastLED" → 更新到最新版本
- *    - 或手动下载：https://github.com/FastLED/FastLED/releases
+ * 优势：
+ * - 只需5个GPIO，完全在ESP32的8个RMT通道限制内
+ * - 同组内灯带显示相同内容（硬件并联）
+ * - 代码更简单，性能更好
  * 
- * 如果FastLED版本不支持I2S，可以：
- * - 方案A：升级FastLED库（推荐）
- * - 方案B：减少灯带数量到8根或更少
- * - 方案C：使用多个ESP32分别控制部分灯带
+ * 接线说明：
+ * - 同组内的灯带数据线（DI）并联连接到对应的GPIO
+ * - 例如：灯带1、2、3、4的数据线都连接到GPIO 2
  */
 
 #include <FastLED.h>
@@ -23,20 +24,22 @@
 // ================= 配置区域 =================
 
 // 1. 灯带参数
-#define NUM_STRIPS      14      // 接口数量
+#define NUM_GROUPS      5       // 组数量（同组灯带共用GPIO）
+#define NUM_STRIPS      14      // 总灯带数量（用于统计）
 #define MAX_LEDS_PER_STRIP  500  // 每根灯带的最大灯珠数（用于数组声明）
 #define LED_TYPE        WS2812B
 #define COLOR_ORDER     GRB
 #define MAX_BRIGHTNESS  255     // FastLED最大亮度值
 
-// 2. 每根灯带的实际灯珠数量（请根据实际情况修改）
-// 数组索引0-13对应灯带1-14
-// 例如：如果灯带1有200颗，灯带2有350颗，则修改为：
-// {200, 350, 300, 300, ...}
-const int LEDS_PER_STRIP[NUM_STRIPS] = {
-    300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300
-    // ↑    ↑    ↑    ↑    ↑    ↑    ↑    ↑    ↑    ↑    ↑    ↑    ↑    ↑
-    // 灯带1 灯带2 灯带3 灯带4 灯带5 灯带6 灯带7 灯带8 灯带9 灯带10 灯带11 灯带12 灯带13 灯带14
+// 2. 每组的实际灯珠数量（请根据实际情况修改）
+// 组索引0-4对应：组1(灯带1-4), 组2(灯带5), 组3(灯带6), 组4(灯带7-10), 组5(灯带11-14)
+// 同组内所有灯带长度相同，共用同一个数据数组
+const int LEDS_PER_GROUP[NUM_GROUPS] = {
+    300,  // 组1：灯带1-4（请根据实际情况修改）
+    300,  // 组2：灯带5（请根据实际情况修改）
+    300,  // 组3：灯带6（请根据实际情况修改）
+    300,  // 组4：灯带7-10（请根据实际情况修改）
+    300   // 组5：灯带11-14（请根据实际情况修改）
 };
 
 // 3. 分段比例（所有灯带统一）
@@ -52,52 +55,35 @@ const int LEDS_PER_STRIP[NUM_STRIPS] = {
 #define TRANSITION_TIME_MS  16000  // 0→100需要16秒
 #define TRANSITION_UPDATE_INTERVAL  20  // 每20ms更新一次
 
-// 4. 定义14个接口的引脚（从小到大：灯带1对应最小，灯带14对应最大）
-const uint8_t STRIP_PINS[NUM_STRIPS] = {
-    2,   // 灯带1  → GPIO 2  (最小)
-    4,   // 灯带2  → GPIO 4
-    5,   // 灯带3  → GPIO 5
-    12,  // 灯带4  → GPIO 12
-    13,  // 灯带5  → GPIO 13
-    14,  // 灯带6  → GPIO 14
-    15,  // 灯带7  → GPIO 15
-    16,  // 灯带8  → GPIO 16
-    17,  // 灯带9  → GPIO 17
-    25,  // 灯带10 → GPIO 25
-    26,  // 灯带11 → GPIO 26
-    27,  // 灯带12 → GPIO 27
-    32,  // 灯带13 → GPIO 32
-    33   // 灯带14 → GPIO 33 (最大)
+// 4. 定义5个组的GPIO引脚（同组灯带硬件并联到同一GPIO）
+const uint8_t GROUP_PINS[NUM_GROUPS] = {
+    2,   // 组1：灯带1-4 → GPIO 2
+    13,  // 组2：灯带5 → GPIO 13
+    14,  // 组3：灯带6 → GPIO 14
+    15,  // 组4：灯带7-10 → GPIO 15
+    26   // 组5：灯带11-14 → GPIO 26
 };
 
-// 5. 灯带到虚拟位置的映射
-// 灯带索引0-13对应灯带1-14
+// 5. 组到虚拟位置的映射
+// 组索引0-4对应：组1(1-4), 组2(5), 组3(6), 组4(7-10), 组5(11-14)
 struct VirtualPosRange {
     float start;  // 起始虚拟位置
     float end;    // 结束虚拟位置
 };
 
-const VirtualPosRange STRIP_VIRTUAL_MAP[NUM_STRIPS] = {
-    {7.0, 14.0},   // 灯带1 (索引0) → 虚拟位置7-14
-    {7.0, 14.0},   // 灯带2 (索引1) → 虚拟位置7-14
-    {7.0, 14.0},   // 灯带3 (索引2) → 虚拟位置7-14
-    {7.0, 14.0},   // 灯带4 (索引3) → 虚拟位置7-14
-    {1.0, 1.0},    // 灯带5 (索引4) → 虚拟位置1
-    {20.0, 20.0},  // 灯带6 (索引5) → 虚拟位置20
-    {15.0, 19.0},  // 灯带7 (索引6) → 虚拟位置15-19
-    {15.0, 19.0},  // 灯带8 (索引7) → 虚拟位置15-19
-    {15.0, 19.0},  // 灯带9 (索引8) → 虚拟位置15-19
-    {15.0, 19.0},  // 灯带10 (索引9) → 虚拟位置15-19
-    {2.0, 6.0},    // 灯带11 (索引10) → 虚拟位置2-6
-    {2.0, 6.0},    // 灯带12 (索引11) → 虚拟位置2-6
-    {2.0, 6.0},    // 灯带13 (索引12) → 虚拟位置2-6
-    {2.0, 6.0}     // 灯带14 (索引13) → 虚拟位置2-6
+const VirtualPosRange GROUP_VIRTUAL_MAP[NUM_GROUPS] = {
+    {7.0, 14.0},   // 组1：灯带1-4 → 虚拟位置7-14
+    {1.0, 1.0},    // 组2：灯带5 → 虚拟位置1
+    {20.0, 20.0},  // 组3：灯带6 → 虚拟位置20
+    {15.0, 19.0},  // 组4：灯带7-10 → 虚拟位置15-19
+    {2.0, 6.0}     // 组5：灯带11-14 → 虚拟位置2-6
 };
 
 // ===========================================
 
-// 灯珠数据二维数组：[第几条带][第几颗灯]
-CRGB leds[NUM_STRIPS][MAX_LEDS_PER_STRIP];
+// 灯珠数据二维数组：[第几组][第几颗灯]
+// 同组内的所有灯带共享相同的数据（硬件并联）
+CRGB leds[NUM_GROUPS][MAX_LEDS_PER_STRIP];
 
 // 全局控制状态
 struct ControlState {
@@ -175,40 +161,20 @@ void setup() {
     Serial.begin(115200);
     delay(100);
     Serial.println("LED Strip Control System Started");
+    Serial.print("Groups: "); Serial.println(NUM_GROUPS);
+    Serial.print("Total Strips: "); Serial.println(NUM_STRIPS);
     
     // 初始化拖尾查找表
     setupTrailTable();
     
-    // 初始化FastLED
-    // ⚠️ 重要：ESP32只有8个RMT通道，但我们需要14根灯带
-    // 解决方案：使用FastLED的I2S驱动（需要FastLED 3.5+版本）
-    // 如果FastLED版本较旧，请升级到最新版本
-    
-    // 方法：使用WS2812Controller800Khz，FastLED会自动选择RMT或I2S
-    // 前8根使用RMT，超过8根后自动使用I2S（如果FastLED版本支持）
-    
-    // 如果遇到"no free tx channels"错误，说明FastLED版本不支持I2S
-    // 解决方案：
-    // 1. 升级FastLED库到3.5.0或更高版本
-    // 2. 或者减少灯带数量到8根或更少
-    
-    FastLED.addLeds<WS2812B, 2,  COLOR_ORDER>(leds[0], LEDS_PER_STRIP[0]);
-    FastLED.addLeds<WS2812B, 4,  COLOR_ORDER>(leds[1], LEDS_PER_STRIP[1]);
-    FastLED.addLeds<WS2812B, 5,  COLOR_ORDER>(leds[2], LEDS_PER_STRIP[2]);
-    FastLED.addLeds<WS2812B, 12, COLOR_ORDER>(leds[3], LEDS_PER_STRIP[3]);
-    FastLED.addLeds<WS2812B, 13, COLOR_ORDER>(leds[4], LEDS_PER_STRIP[4]);
-    FastLED.addLeds<WS2812B, 14, COLOR_ORDER>(leds[5], LEDS_PER_STRIP[5]);
-    FastLED.addLeds<WS2812B, 15, COLOR_ORDER>(leds[6], LEDS_PER_STRIP[6]);
-    FastLED.addLeds<WS2812B, 16, COLOR_ORDER>(leds[7], LEDS_PER_STRIP[7]);
-    
-    // 第9-14根：如果FastLED支持I2S，这些会使用I2S驱动
-    // 如果不支持，这里会报错，需要升级FastLED库
-    FastLED.addLeds<WS2812B, 17, COLOR_ORDER>(leds[8], LEDS_PER_STRIP[8]);
-    FastLED.addLeds<WS2812B, 25, COLOR_ORDER>(leds[9], LEDS_PER_STRIP[9]);
-    FastLED.addLeds<WS2812B, 26, COLOR_ORDER>(leds[10], LEDS_PER_STRIP[10]);
-    FastLED.addLeds<WS2812B, 27, COLOR_ORDER>(leds[11], LEDS_PER_STRIP[11]);
-    FastLED.addLeds<WS2812B, 32, COLOR_ORDER>(leds[12], LEDS_PER_STRIP[12]);
-    FastLED.addLeds<WS2812B, 33, COLOR_ORDER>(leds[13], LEDS_PER_STRIP[13]);
+    // 初始化FastLED（5组，每组一个GPIO）
+    // 同组内的灯带通过硬件并联连接到同一个GPIO
+    // 这样只需5个GPIO，完全在ESP32的8个RMT通道限制内
+    FastLED.addLeds<WS2812B, 2,  COLOR_ORDER>(leds[0], LEDS_PER_GROUP[0]);  // 组1：灯带1-4
+    FastLED.addLeds<WS2812B, 13, COLOR_ORDER>(leds[1], LEDS_PER_GROUP[1]);  // 组2：灯带5
+    FastLED.addLeds<WS2812B, 14, COLOR_ORDER>(leds[2], LEDS_PER_GROUP[2]);  // 组3：灯带6
+    FastLED.addLeds<WS2812B, 15, COLOR_ORDER>(leds[3], LEDS_PER_GROUP[3]);  // 组4：灯带7-10
+    FastLED.addLeds<WS2812B, 26, COLOR_ORDER>(leds[4], LEDS_PER_GROUP[4]);  // 组5：灯带11-14
     
     FastLED.setBrightness(MAX_BRIGHTNESS);
     FastLED.clear();
@@ -312,9 +278,9 @@ void updateVirtualPosition() {
 }
 
 // 渲染功能A（间隔点亮）
-void renderFunctionA(int stripIndex) {
+void renderFunctionA(int groupIndex) {
     uint8_t brightnessA = mapControlToBrightnessA(state.currentControlValue);
-    int totalLeds = LEDS_PER_STRIP[stripIndex];
+    int totalLeds = LEDS_PER_GROUP[groupIndex];
     
     // 动态计算分段位置（a=0%, b=25%, c=75%, d=100%）
     int segAStart = 0;                              // a = 0%
@@ -325,27 +291,27 @@ void renderFunctionA(int stripIndex) {
     // 区域1：a→b (0% - 25%)
     for (int i = segAStart; i < segBStart; i++) {
         if (i % 3 == 0) {  // 每隔2颗亮1颗（每3颗中第1颗）
-            leds[stripIndex][i] = CHSV(0, 0, brightnessA); // 白色，HSV模式
+            leds[groupIndex][i] = CHSV(0, 0, brightnessA); // 白色，HSV模式
         } else {
-            leds[stripIndex][i] = CRGB::Black;
+            leds[groupIndex][i] = CRGB::Black;
         }
     }
     
     // 区域2：c→d (75% - 100%)
     for (int i = segCStart; i < segDEnd; i++) {
         if (i % 3 == 0) {  // 每隔2颗亮1颗
-            leds[stripIndex][i] = CHSV(0, 0, brightnessA);
+            leds[groupIndex][i] = CHSV(0, 0, brightnessA);
         } else {
-            leds[stripIndex][i] = CRGB::Black;
+            leds[groupIndex][i] = CRGB::Black;
         }
     }
 }
 
 // 渲染功能B（虚拟位置系统）
-void renderFunctionB(int stripIndex) {
+void renderFunctionB(int groupIndex) {
     uint8_t baseBrightnessB = mapControlToBrightnessB(state.currentControlValue);
-    VirtualPosRange range = STRIP_VIRTUAL_MAP[stripIndex];
-    int totalLeds = LEDS_PER_STRIP[stripIndex];
+    VirtualPosRange range = GROUP_VIRTUAL_MAP[groupIndex];
+    int totalLeds = LEDS_PER_GROUP[groupIndex];
     
     // 动态计算分段位置（b=25%, c=75%）
     int bStart = (int)(totalLeds * 0.25);  // b = 25%
@@ -356,7 +322,7 @@ void renderFunctionB(int stripIndex) {
         // 将灯珠索引映射到虚拟位置
         float localPos;
         if (range.start == range.end) {
-            // 单个虚拟位置（如灯带5显示位置1）
+            // 单个虚拟位置（如组2显示位置1）
             localPos = range.start;
         } else {
             // 多个虚拟位置范围（线性映射）
@@ -372,7 +338,7 @@ void renderFunctionB(int stripIndex) {
         
         // 应用亮度
         uint8_t finalBrightness = (uint8_t)(baseBrightnessB * trailBrightness);
-        leds[stripIndex][i] = CHSV(160, 255, finalBrightness); // 青色，HSV模式
+        leds[groupIndex][i] = CHSV(160, 255, finalBrightness); // 青色，HSV模式
     }
 }
 
@@ -391,19 +357,19 @@ void loop() {
     // 3. 更新虚拟位置
     updateVirtualPosition();
     
-    // 4. 渲染所有灯带
-    for (int s = 0; s < NUM_STRIPS; s++) {
-        int totalLeds = LEDS_PER_STRIP[s];
+    // 4. 渲染所有组（5组）
+    for (int g = 0; g < NUM_GROUPS; g++) {
+        int totalLeds = LEDS_PER_GROUP[g];
         // 先清空
         for (int i = 0; i < totalLeds; i++) {
-            leds[s][i] = CRGB::Black;
+            leds[g][i] = CRGB::Black;
         }
         
         // 渲染功能A
-        renderFunctionA(s);
+        renderFunctionA(g);
         
         // 渲染功能B
-        renderFunctionB(s);
+        renderFunctionB(g);
     }
     
     // 5. 更新显示
