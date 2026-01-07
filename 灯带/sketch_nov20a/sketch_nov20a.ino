@@ -60,26 +60,30 @@ const int LEDS_PER_GROUP[NUM_GROUPS] = {
 #define TRANSITION_UPDATE_INTERVAL  20  // 每20ms更新一次
 
 // 5. 潮汐桥参数
-#define TIDAL_STRIP_1_LEDS    120     // GPIO 22: 2m灯带（120 LEDs）
-#define TIDAL_STRIP_2_LEDS    180     // GPIO 23: 3m灯带（180 LEDs）
+#define TIDAL_STRIP_1_LEDS    200     // GPIO 22: 2m灯带（200 LEDs）
+#define TIDAL_STRIP_2_LEDS    300     // GPIO 23: 3m灯带（300 LEDs）
 #define TIDAL_PIN_1           22      // GPIO 22
 #define TIDAL_PIN_2           23      // GPIO 23
 
 // 潮汐桥波浪参数
-#define WAVE_SPEED_BASE         10.0    // 基础传播速度 (LEDs/秒)
-#define WAVE_SPEED_MULTIPLIER   0.5     // 速度随n的增量
+// n=0: 200灯需要2m15s(135秒) = 1.481 LEDs/秒
+// n=100: 200灯需要2m5s(125秒) = 1.6 LEDs/秒
+#define WAVE_SPEED_MIN         1.48    // n=0时的速度 (LEDs/秒)
+#define WAVE_SPEED_MAX         1.6     // n=100时的速度 (LEDs/秒)
 #define WAVE_WIDTH              30.0    // 波浪影响宽度（LEDs）
-#define WAVE_DECAY              0.3     // 拖尾衰减系数
-#define RESTART_DELAY_MS        500     // 重置前的停顿时间（毫秒）
+#define RESTART_DELAY_MS        0      // 重置前的停顿时间（毫秒，0表示无停顿）
 
 // 潮汐桥颜色参数
-#define RED_RATIO_BASE          0.2     // 基础红色区域比例（20%）
-#define RED_RATIO_INCREMENT     0.003   // 红色比例随n的增量
-#define COLOR_VARIATION         5.0     // 颜色波动范围（度）
+#define RED_RATIO_MIN          0.2     // n=0时红色区域比例（20%）
+#define RED_RATIO_MAX          0.5     // n=100时红色区域比例（50%）
+#define BLUE_RATIO             0.6     // 寒色区域固定比例（60%）
 
 // 潮汐桥亮度参数
-#define BRIGHTNESS_START_RATIO  0.3     // 起始位置亮度比例
-#define BRIGHTNESS_END_RATIO    1.0     // 末端位置亮度比例
+#define BRIGHTNESS_START       30      // 起始位置亮度（0%位置，红色区域）
+#define BRIGHTNESS_END         80      // 末端位置亮度（红色和寒色区域结束位置）
+#define BRIGHTNESS_WHITE       100     // 白色区域最亮（不算波浪，应该比红色区域亮但不要太亮）
+#define WAVE_BOOST_RATIO       0.2     // 波浪亮度提高比例（20%）
+#define COLOR_TRANSITION_WIDTH 0.05    // 颜色渐变过渡区域宽度（5%）
 
 // 6. 定义5个组的GPIO引脚（同组灯带硬件并联到同一GPIO）
 const uint8_t GROUP_PINS[NUM_GROUPS] = {
@@ -165,9 +169,7 @@ TidalStripState tidal_strip2_state = {
 };
 
 // 注意：ESP32的GPIO22就是数字22，不是D22（D22是Arduino Mega的命名方式）
-
-// 潮汐桥拖尾亮度查找表
-float tidalTrailBrightnessTable[61];  // 距离0-60，步长1
+// 注意：波浪效果现在直接在calculateTidalLEDColor中计算，不再需要查找表
 
 // 拖尾衰减查找表（预计算，避免实时计算指数函数）
 // 距离0-2.0，步长0.1，共21个值
@@ -184,24 +186,7 @@ void setupTrailTable() {
     }
 }
 
-// 初始化潮汐桥拖尾查找表
-void setupTidalTrailTable() {
-    for (int i = 0; i <= 60; i++) {
-        float distance = (float)i;
-        float brightness = exp(-distance * distance / (WAVE_DECAY * WAVE_WIDTH * WAVE_WIDTH));
-        tidalTrailBrightnessTable[i] = brightness;
-    }
-}
-
-// 根据距离获取潮汐桥拖尾亮度（0.0-1.0）
-float getTidalTrailBrightness(float distance) {
-    if (distance >= WAVE_WIDTH) return 0.0;
-    
-    int index = (int)distance;
-    if (index > 60) index = 60;
-    
-    return tidalTrailBrightnessTable[index];
-}
+// 注意：波浪效果现在直接在calculateTidalLEDColor中计算，不再需要查找表
 
 // 根据距离获取拖尾亮度（0.0-1.0）
 float getTrailBrightness(float distance) {
@@ -239,14 +224,15 @@ uint8_t mapControlToBrightnessB(float controlValue) {
 // ================= 潮汐桥函数 =================
 
 // 计算波浪传播速度
+// n=0: 1.48 LEDs/秒, n=100: 1.6 LEDs/秒
 float calculateWaveSpeed(float n) {
-    return WAVE_SPEED_BASE + n * WAVE_SPEED_MULTIPLIER;
+    return WAVE_SPEED_MIN + (n / 100.0) * (WAVE_SPEED_MAX - WAVE_SPEED_MIN);
 }
 
 // 计算红色区域比例
+// n=0: 20%, n=100: 50%
 float calculateRedRatio(float n) {
-    float ratio = RED_RATIO_BASE + n * RED_RATIO_INCREMENT;
-    return constrain(ratio, 0.0, 0.5);  // 限制在0-50%之间
+    return RED_RATIO_MIN + (n / 100.0) * (RED_RATIO_MAX - RED_RATIO_MIN);
 }
 
 // 更新潮汐桥波浪位置
@@ -256,24 +242,21 @@ void updateTidalWavePosition(TidalStripState* state, int totalLEDs) {
         return;
     }
     
-    if (state->isRestarting) {
-        // 检查是否结束停顿
-        if (millis() - state->restartStartTime >= RESTART_DELAY_MS) {
-            state->isRestarting = false;
-            state->wavePosition = 0.0;
-            state->lastUpdateTime = millis();
-        }
-        return;
-    }
-    
     // 确保时间基准已初始化
     if (state->lastUpdateTime == 0) {
         state->lastUpdateTime = millis();
+        state->wavePosition = 0.0;  // 确保从0开始
         return;
     }
     
     unsigned long currentTime = millis();
     float deltaTime = (currentTime - state->lastUpdateTime) / 1000.0; // 转换为秒
+    
+    // 防止deltaTime过大（比如系统重启后）
+    if (deltaTime > 1.0) {
+        deltaTime = 0.016;  // 限制为约60fps的帧时间
+    }
+    
     state->lastUpdateTime = currentTime;
     
     // 计算传播速度
@@ -282,45 +265,51 @@ void updateTidalWavePosition(TidalStripState* state, int totalLEDs) {
     // 更新波浪位置
     state->wavePosition += speed * deltaTime;
     
-    // 检查是否到达末端
-    if (state->wavePosition >= totalLEDs) {
-        state->isRestarting = true;
-        state->restartStartTime = millis();
-        state->wavePosition = totalLEDs;  // 保持在末端位置
+    // 检查是否到达末端（无停顿，立即重新开始）
+    while (state->wavePosition >= totalLEDs) {
+        state->wavePosition -= totalLEDs;  // 循环回到起始位置
     }
 }
 
-// 获取位置在灯带上的颜色（基于长度分布）
+// 获取位置在灯带上的颜色（基于长度分布，带渐变过渡）
 CHSV getTidalBaseColorByPosition(float position, float n) {
     // position: 0.0-1.0，表示在灯带上的位置
     float redRatio = calculateRedRatio(n);
-    float blueRatio = 0.6;  // 中间60%是浅蓝色
+    float blueRatio = BLUE_RATIO;  // 固定60%是寒色
     float whiteRatio = 1.0 - redRatio - blueRatio;  // 剩余部分是白色
     
     // 计算各区域的边界
     float redEnd = redRatio;
     float blueEnd = redRatio + blueRatio;
     
-    if (position < redEnd) {
-        // 红色区域
-        float progress = position / redEnd;  // 0.0-1.0
-        // 添加轻微的颜色波动
-        float hueVariation = sin(millis() / 1000.0 + position * 10.0) * COLOR_VARIATION;
-        return CHSV(0 + hueVariation, 255, 255);  // 红色，HSV模式
-    } else if (position < blueEnd) {
-        // 浅蓝色区域
-        float progress = (position - redEnd) / blueRatio;  // 0.0-1.0
-        // 从红色过渡到浅蓝色
-        float hue = 0 + progress * 180;  // 0°(红) → 180°(青/浅蓝)
-        float hueVariation = sin(millis() / 800.0 + position * 8.0) * COLOR_VARIATION;
-        return CHSV(hue + hueVariation, 200, 255);  // 浅蓝色，降低饱和度
+    // 渐变过渡区域宽度
+    float transitionWidth = COLOR_TRANSITION_WIDTH;
+    
+    if (position < redEnd - transitionWidth) {
+        // 红色区域：纯红色
+        return CHSV(0, 255, 255);  // HSV: 色相0(红), 饱和度255, 亮度255
+    } else if (position < redEnd + transitionWidth) {
+        // 红色到蓝色的渐变区域
+        float progress = (position - (redEnd - transitionWidth)) / (2.0 * transitionWidth);
+        progress = constrain(progress, 0.0, 1.0);
+        // 色相从0(红)渐变到160(蓝)
+        uint8_t hue = (uint8_t)(0 + progress * 160);
+        // 饱和度从255渐变到200
+        uint8_t sat = (uint8_t)(255 - progress * 55);
+        return CHSV(hue, sat, 255);
+    } else if (position < blueEnd - transitionWidth) {
+        // 寒色区域：浅蓝色
+        return CHSV(160, 200, 255);  // HSV: 色相160(浅蓝), 饱和度200, 亮度255
+    } else if (position < blueEnd + transitionWidth) {
+        // 蓝色到白色的渐变区域
+        float progress = (position - (blueEnd - transitionWidth)) / (2.0 * transitionWidth);
+        progress = constrain(progress, 0.0, 1.0);
+        // 色相保持160(蓝)，饱和度从200渐变到0(白色)
+        uint8_t sat = (uint8_t)(200 - progress * 200);
+        return CHSV(160, sat, 255);
     } else {
-        // 白色区域
-        float progress = (position - blueEnd) / whiteRatio;  // 0.0-1.0
-        // 从浅蓝色过渡到白色（降低饱和度）
-        float saturation = 200 - progress * 200;  // 200 → 0
-        float hueVariation = sin(millis() / 1200.0 + position * 6.0) * COLOR_VARIATION;
-        return CHSV(180 + hueVariation, saturation, 255);
+        // 白色区域：白色
+        return CHSV(0, 0, 255);  // HSV: 色相0, 饱和度0(白色), 亮度255
     }
 }
 
@@ -328,51 +317,53 @@ CHSV getTidalBaseColorByPosition(float position, float n) {
 CRGB calculateTidalLEDColor(int ledIndex, int totalLEDs, TidalStripState* state) {
     float position = (float)ledIndex / totalLEDs;  // 0.0-1.0
     
-    // 1. 获取基础颜色（基于长度分布）
+    // 1. 获取基础颜色（固定颜色，无波动，不改变）
     CHSV baseColorHSV = getTidalBaseColorByPosition(position, state->controlValue);
     
-    // 2. 计算波浪影响
+    // 2. 计算基础亮度（30-80渐变，红色区域保持较低亮度）
+    float baseBrightness;
+    float redRatio = calculateRedRatio(state->controlValue);
+    float blueEnd = redRatio + BLUE_RATIO;
+    
+    if (position >= blueEnd) {
+        // 白色区域：最亮100（不算波浪）
+        baseBrightness = BRIGHTNESS_WHITE;
+    } else if (position < redRatio) {
+        // 红色区域：保持较低亮度30-40（根据位置在红色区域内的比例）
+        float redProgress = position / redRatio;  // 在红色区域内的进度0-1
+        baseBrightness = BRIGHTNESS_START + redProgress * 10.0;  // 30-40
+    } else {
+        // 寒色区域：从红色区域结束处(40)渐变到80
+        float blueProgress = (position - redRatio) / BLUE_RATIO;  // 在寒色区域内的进度0-1
+        baseBrightness = 40.0 + blueProgress * (BRIGHTNESS_END - 40.0);  // 40-80
+    }
+    
+    // 3. 波浪效果：只提高亮度20%，不改变颜色
+    // 计算到波浪位置的距离（考虑循环）
     float distToWave = fabs((float)ledIndex - state->wavePosition);
-    float waveInfluence = getTidalTrailBrightness(distToWave);
+    // 如果距离超过灯带长度的一半，从另一侧计算（考虑循环）
+    if (distToWave > totalLEDs / 2.0) {
+        distToWave = totalLEDs - distToWave;
+    }
     
-    // 3. 波前颜色（红色，更鲜艳）
-    CHSV waveColorHSV = CHSV(0, 255, 255);  // 纯红色
+    float waveBoost = 0.0;
     
-    // 4. 混合颜色（基于波浪影响）
-    float waveHue = waveColorHSV.h;
-    float baseHue = baseColorHSV.h;
-    float mixedHue;
+    if (distToWave < WAVE_WIDTH) {
+        // 波浪影响范围内，使用高斯衰减
+        float waveInfluence = exp(-distToWave * distToWave / (WAVE_WIDTH * WAVE_WIDTH * 0.5));
+        // 亮度提高20%
+        waveBoost = baseBrightness * WAVE_BOOST_RATIO * waveInfluence;
+    }
     
-    // 色相插值（考虑色相是循环的）
-    float hueDiff = waveHue - baseHue;
-    if (hueDiff > 128) hueDiff -= 256;
-    if (hueDiff < -128) hueDiff += 256;
-    mixedHue = baseHue + hueDiff * waveInfluence;
-    if (mixedHue < 0) mixedHue += 256;
-    if (mixedHue >= 256) mixedHue -= 256;
+    // 4. 整体亮度由n控制（0-100映射到0-1）
+    float globalBrightness = state->controlValue / 100.0;
     
-    float mixedSat = baseColorHSV.s + (waveColorHSV.s - baseColorHSV.s) * waveInfluence;
-    mixedSat = constrain(mixedSat, 0, 255);
+    // 5. 最终亮度
+    float finalBrightness = (baseBrightness + waveBoost) * globalBrightness;
+    finalBrightness = constrain(finalBrightness, 0, 255);
     
-    // 5. 计算亮度
-    // 静态亮度分布（从头到尾变亮）
-    float staticBrightness = BRIGHTNESS_START_RATIO + 
-                            (position * (BRIGHTNESS_END_RATIO - BRIGHTNESS_START_RATIO));
-    
-    // 波浪亮度（波前增强，拖尾衰减但不完全消失）
-    float waveBrightness = 0.3 + waveInfluence * 0.7;  // 0.3-1.0范围
-    
-    // 整体亮度（由n控制）
-    float baseBrightness = state->controlValue / 100.0;
-    
-    // 最终亮度
-    float finalBrightness = staticBrightness * waveBrightness * baseBrightness;
-    finalBrightness = constrain(finalBrightness, 0.0, 1.0);
-    
-    uint8_t brightnessValue = (uint8_t)(finalBrightness * 255);
-    
-    // 6. 转换为RGB
-    CHSV finalHSV = CHSV((uint8_t)mixedHue, (uint8_t)mixedSat, brightnessValue);
+    // 6. 保持颜色不变，只改变亮度
+    CHSV finalHSV = CHSV(baseColorHSV.h, baseColorHSV.s, (uint8_t)finalBrightness);
     CRGB finalRGB;
     hsv2rgb_spectrum(finalHSV, finalRGB);
     
@@ -399,7 +390,7 @@ void setup() {
     
     // 初始化拖尾查找表
     setupTrailTable();
-    setupTidalTrailTable();
+    // 注意：潮汐桥不再需要查找表，波浪效果直接计算
     
     // 初始化FastLED（5组，每组一个GPIO）
     // 同组内的灯带通过硬件并联连接到同一个GPIO
@@ -468,24 +459,31 @@ void parseCommand(String cmd) {
             state.transitionStartTime = millis();
             state.isTransitioning = true;
             
+            // 重置时间基准，确保速度立即改变（避免累积误差）
+            state.lastUpdateTime = millis();
+            
             // 同时更新潮汐桥的控制值（直接设置，不过渡）
             tidal_strip1_state.controlValue = targetValue;
             tidal_strip2_state.controlValue = targetValue;
             
-            // 如果设置非零值，确保潮汐桥时间基准已初始化
-            if (targetValue > 0) {
-                unsigned long now = millis();
-                if (tidal_strip1_state.lastUpdateTime == 0) {
-                    tidal_strip1_state.lastUpdateTime = now;
-                }
-                if (tidal_strip2_state.lastUpdateTime == 0) {
-                    tidal_strip2_state.lastUpdateTime = now;
-                }
+            // 重置潮汐桥时间基准，确保速度立即改变
+            unsigned long now = millis();
+            tidal_strip1_state.lastUpdateTime = now;
+            tidal_strip2_state.lastUpdateTime = now;
+            
+            // 如果设置为0，重置波浪位置
+            if (targetValue == 0) {
+                tidal_strip1_state.wavePosition = 0.0;
+                tidal_strip2_state.wavePosition = 0.0;
             }
             
             Serial.print("OK: Set target to ");
             Serial.print(targetValue);
-            Serial.println(" (14 strips + tidal bridge)");
+            Serial.print(" (14 strips speed: ");
+            Serial.print(targetValue + 10.0);
+            Serial.print(" pos/sec, Tidal speed: ");
+            Serial.print(calculateWaveSpeed(targetValue), 2);
+            Serial.println(" LEDs/sec)");
         }
     }
     else if (cmd == "s") {
@@ -540,10 +538,17 @@ void updateVirtualPosition() {
     
     unsigned long currentTime = millis();
     float deltaTime = (currentTime - state.lastUpdateTime) / 1000.0; // 转换为秒
+    
+    // 防止deltaTime过大（比如系统重启后）
+    if (deltaTime > 1.0) {
+        deltaTime = 0.016;  // 限制为约60fps的帧时间
+    }
+    
     state.lastUpdateTime = currentTime;
     
     // 计算速度：v = n + 10
-    float speed = state.currentControlValue + 10.0;
+    // 使用targetControlValue确保速度立即改变，而不是平滑过渡
+    float speed = state.targetControlValue + 10.0;
     
     // 更新虚拟位置
     state.globalVirtualPos += speed * deltaTime;
