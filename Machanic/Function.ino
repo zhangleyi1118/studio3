@@ -5,10 +5,10 @@
 //   - 步进电机滑台：STEP=D54, DIR=D55, ENA=D56
 //   - 舵机MG996R：PWM引脚 D9
 //
-// 进度定义（100%基准）：统一15秒作为100%时间
-//   - 伸缩杆：10cm @ 6mm/s → 统一到15秒
-//   - 滑台：100cm @ 60mm/s → 统一到15秒
-//   - 舵机：180° @ 10°/s → 统一到15秒（转不到底没关系）
+// 进度定义（100%基准）：统一16.67秒作为100%时间
+//   - 伸缩杆：10cm @ 6mm/s → 统一到16.67秒
+//   - 滑台：100cm @ 60mm/s → 统一到16.67秒
+//   - 舵机：180° @ 10°/s → 统一到16.67秒（转不到底没关系）
 
 #include <Servo.h>
 
@@ -66,7 +66,7 @@ Servo servo;
 struct MotionState {
   bool isRunning;
   unsigned long startTime;
-  unsigned long duration;  // 毫秒，统一为 15000ms * percent / 100
+  unsigned long duration;  // 毫秒，统一为 16670ms * percent / 100
   char direction;  // 'F' forward, 'B' backward, 'L' left, 'R' right
   int percent;
 };
@@ -136,8 +136,8 @@ uint8_t cmdIndex = 0;
 
 // === 时间计算 ===
 unsigned long calculateDuration(int percent) {
-  // 统一时间基准：15秒 = 100%
-  return (unsigned long)(15000 * percent / 100);
+  // 统一时间基准：16.67秒 = 100%
+  return (unsigned long)(16670 * percent / 100);
 }
 
 // === PWM冲突防护：组控制函数（重要！） ===
@@ -286,15 +286,17 @@ void startMainMotion(int percent, char direction) {
   int speed = 255;  // 100%速度
   
   if (direction == 'F') {
-    moveGroupForward(1, speed);
-    moveGroupForward(2, speed);
-    startStepper(false, percent);  // 右移
-    setServoAngle(180, percent);   // 逆时针转
-  } else {  // 'B'
+    // 伸缩杆f/b对调：F命令对应backward（收回）
     moveGroupBackward(1, speed);
     moveGroupBackward(2, speed);
-    startStepper(true, percent);   // 左移
-    setServoAngle(0, percent);     // 顺时针转（回到0度）
+    startStepper(false, percent);  // 右移（步进电机不变）
+    setServoAngle(180, percent);   // 逆时针转（舵机不变）
+  } else {  // 'B'
+    // 伸缩杆f/b对调：B命令对应forward（伸出）
+    moveGroupForward(1, speed);
+    moveGroupForward(2, speed);
+    startStepper(true, percent);   // 左移（步进电机不变）
+    setServoAngle(0, percent);     // 顺时针转（回到0度，舵机不变）
   }
   
   // 更新状态
@@ -419,13 +421,14 @@ void executeDebugCommand(const ParsedCommand &cmd) {
   unsigned long now = millis();
   
   if (cmd.isGroup1 || cmd.isAll) {
+    // 伸缩杆f/b对调：F对应backward，B对应forward
     if (cmd.debugDirection == 'F') {
-      moveGroupForward(1, speed);
+      moveGroupBackward(1, speed);
       systemState.group1.startTime = now;
       systemState.group1.duration = duration;
       systemState.group1.percent = cmd.debugPercent;
     } else if (cmd.debugDirection == 'B') {
-      moveGroupBackward(1, speed);
+      moveGroupForward(1, speed);
       systemState.group1.startTime = now;
       systemState.group1.duration = duration;
       systemState.group1.percent = cmd.debugPercent;
@@ -435,13 +438,14 @@ void executeDebugCommand(const ParsedCommand &cmd) {
   }
   
   if (cmd.isGroup2 || cmd.isAll) {
+    // 伸缩杆f/b对调：F对应backward，B对应forward
     if (cmd.debugDirection == 'F') {
-      moveGroupForward(2, speed);
+      moveGroupBackward(2, speed);
       systemState.group2.startTime = now;
       systemState.group2.duration = duration;
       systemState.group2.percent = cmd.debugPercent;
     } else if (cmd.debugDirection == 'B') {
-      moveGroupBackward(2, speed);
+      moveGroupForward(2, speed);
       systemState.group2.startTime = now;
       systemState.group2.duration = duration;
       systemState.group2.percent = cmd.debugPercent;
