@@ -55,9 +55,11 @@ const int LEDS_PER_GROUP[NUM_GROUPS] = {
 // 分段位置会根据每根灯带的实际灯珠数动态计算
 
 // 3. 虚拟位置参数
-#define VIRTUAL_POS_MIN  1.0
-#define VIRTUAL_POS_MAX  20.0
-#define TRAIL_RANGE      2.0    // 拖尾前后各2个虚拟位置
+#define PHASE_PERIOD     21.0   // 波相位周期 [0, 21)
+#define PHASE_SPEED_SLOW 0.22   // 慢速（虚拟位置单位/秒）
+#define PHASE_SPEED_FAST 3.2    // 快速（虚拟位置单位/秒）
+#define EVENT_COOLDOWN   1.8    // 事件层冷却时间（秒）
+#define TRAIL_RANGE      2.0    // 拖尾前后各2个虚拟位置（保留用于兼容）
 
 // 4. 亮度过渡参数
 #define TRANSITION_TIME_MS  16000  // 0→100需要16秒
@@ -143,9 +145,15 @@ struct ControlState {
     float transitionStartValue;  // 过渡开始时的值
     bool isTransitioning;        // 是否正在过渡
     
-    float globalVirtualPos;      // 全局虚拟位置 (1.0-20.0)
+    float phase;                 // 波相位 [0, 21)，从0开始
     bool isPaused;               // 是否暂停
     unsigned long lastUpdateTime; // 上次更新时间（用于计算deltaTime）
+    
+    // 事件层状态
+    float eventIntensity;         // 当前事件强度 (0-1)
+    float eventPhase;            // 事件相位（用于扫过效果）
+    unsigned long lastEventTime;  // 上次事件时间（用于cooldown）
+    float globalTime;            // 全局时间（秒，用于湍流等时间相关效果）
 };
 
 ControlState state = {
@@ -154,9 +162,13 @@ ControlState state = {
     .transitionStartTime = 0,
     .transitionStartValue = 0.0,
     .isTransitioning = false,
-    .globalVirtualPos = 1.0,
+    .phase = 0.0,                // 波从0开始
     .isPaused = false,
-    .lastUpdateTime = 0
+    .lastUpdateTime = 0,
+    .eventIntensity = 0.0,
+    .eventPhase = 0.0,
+    .lastEventTime = 0,
+    .globalTime = 0.0
 };
 
 // 粒子结构体
@@ -235,14 +247,10 @@ float getTrailBrightness(float distance) {
     return trailBrightnessTable[index];
 }
 
-// 计算循环距离（考虑1和20相邻）
-float getCyclicDistance(float pos1, float pos2) {
+// 计算循环距离（支持任意周期）
+float getCyclicDistance(float pos1, float pos2, float period) {
     float dist = fabs(pos1 - pos2);
-    // 如果距离大于10，说明应该从另一侧绕
-    if (dist > 10.0) {
-        dist = VIRTUAL_POS_MAX - dist;
-    }
-    return dist;
+    return min(dist, period - dist);
 }
 
 // 将控制值映射到功能A的亮度 (0-100 → 20-40)
@@ -504,13 +512,20 @@ CRGB calculateTidalLEDColor(int ledIndex, int totalLEDs, TidalStripState* state)
     float s = n_mapped / 100.0;
     float t = state->globalTime;
     
-    // 1. 底色渐变 × baseGain
+    // 1. 底色渐变 × baseGain × 位置亮度系数
     CRGB baseColor = getGradientColor(u);
-    float baseGain = lerpFloat(0.10, 0.45, s);
+    
+    // 整体亮度系数（降低范围，让底色更暗，突出粒子流）
+    float baseGain = lerpFloat(0.05, 0.30, s);
+    
+    // 位置相关的亮度系数（开头0.4，尾部0.8，平滑过渡）
+    float positionBrightness = lerpFloat(0.4, 0.8, u);
+    
+    // 最终底色亮度
     CRGB color;
-    color.r = (uint8_t)(baseColor.r * baseGain);
-    color.g = (uint8_t)(baseColor.g * baseGain);
-    color.b = (uint8_t)(baseColor.b * baseGain);
+    color.r = (uint8_t)(baseColor.r * baseGain * positionBrightness);
+    color.g = (uint8_t)(baseColor.g * baseGain * positionBrightness);
+    color.b = (uint8_t)(baseColor.b * baseGain * positionBrightness);
     
     // 2. + 亮核区颜色 × coreBoost
     float coreBoost = calculateCoreBoost(u, n_mapped, t);
@@ -624,6 +639,13 @@ void parseCommand(String cmd) {
             
             // 重置时间基准，确保速度立即改变（避免累积误差）
             state.lastUpdateTime = millis();
+            // 重置事件层状态（如果设置为0）
+            if (targetValue == 0) {
+                state.eventIntensity = 0.0;
+                state.eventPhase = 0.0;
+                state.lastEventTime = 0;
+                state.globalTime = 0.0;
+            }
             
             // 同时更新潮汐桥的控制值（直接设置，不过渡）
             tidal_strip1_state.controlValue = targetValue;
@@ -701,7 +723,7 @@ void updateBrightnessTransition() {
     }
 }
 
-// 更新虚拟位置
+// 更新波相位
 void updateVirtualPosition() {
     if (state.isPaused) return;
     
@@ -714,21 +736,128 @@ void updateVirtualPosition() {
     }
     
     state.lastUpdateTime = currentTime;
+    state.globalTime += deltaTime;  // 更新全局时间（用于湍流等）
     
-    // 计算速度：v = n + 10
-    // 使用targetControlValue确保速度立即改变，而不是平滑过渡
-    float speed = state.targetControlValue + 10.0;
+    // n映射：t = clamp(n/100, 0..1), k = smoothstep(t)
+    float n = state.targetControlValue;  // 使用targetControlValue确保速度立即改变
+    float t = constrain(n / 100.0, 0.0, 1.0);
+    float k = smoothstep(0.0, 1.0, t);  // 或使用 t*t，这里用smoothstep更平滑
     
-    // 更新虚拟位置
-    state.globalVirtualPos += speed * deltaTime;
+    // 速度计算：speed = lerp(slow, fast, k)
+    float speed = lerpFloat(PHASE_SPEED_SLOW, PHASE_SPEED_FAST, k);
     
-    // 循环处理：1.0-20.0
-    while (state.globalVirtualPos > VIRTUAL_POS_MAX) {
-        state.globalVirtualPos -= (VIRTUAL_POS_MAX - VIRTUAL_POS_MIN + 1.0);
+    // 更新相位：[0, 21)
+    state.phase = fmod(state.phase + speed * deltaTime, PHASE_PERIOD);
+    if (state.phase < 0.0) {
+        state.phase += PHASE_PERIOD;
     }
-    while (state.globalVirtualPos < VIRTUAL_POS_MIN) {
-        state.globalVirtualPos += (VIRTUAL_POS_MAX - VIRTUAL_POS_MIN + 1.0);
+}
+
+// 计算端点拉伸后的虚拟位置
+float calculateStretchedPos(float basePos, float n) {
+    float t = constrain(n / 100.0, 0.0, 1.0);
+    float s = smoothstep(0.0, 1.0, t);  // 或 t*t，这里用smoothstep更平滑
+    
+    if (basePos == 1.0) {
+        // 组2：1 → 0
+        float pos = 1.0 - 1.0 * s;
+        return (pos >= 0.0) ? pos : 0.0;
+    } else if (basePos == 20.0) {
+        // 组3：20 → 21
+        float pos = 20.0 + 1.0 * s;
+        return (pos < 21.0) ? pos : (21.0 - 1e-4);  // 方案A：限制在[0,21)
     }
+    return basePos;  // 其他位置不变
+}
+
+// 计算主暗波（高斯脉冲下陷）
+float calculateMainDarkWave(float pos, float phase, float n) {
+    float t = constrain(n / 100.0, 0.0, 1.0);
+    float k = smoothstep(0.0, 1.0, t);  // 或 t*t
+    
+    // 计算循环距离
+    float d = getCyclicDistance(pos, phase, PHASE_PERIOD);
+    
+    // 波宽和深度随n变化
+    float width = lerpFloat(1.5, 0.8, k);  // n大时更窄
+    float depth = lerpFloat(0.3, 0.85, k);   // n大时更深
+    
+    // 高斯脉冲下陷
+    float pulse = exp(-(d * d) / (width * width));
+    return depth * pulse;
+}
+
+// 计算回弹过冲效果
+float calculateOvershoot(float pos, float phase, float n) {
+    float t = constrain(n / 100.0, 0.0, 1.0);
+    float k = smoothstep(0.0, 1.0, t);
+    
+    float d = getCyclicDistance(pos, phase, PHASE_PERIOD);
+    float offset = 0.4;  // 回弹位置偏移
+    float width2 = 0.6;
+    float gain = lerpFloat(0.05, 0.25, k);
+    
+    float overshoot = gain * exp(-((d - offset) * (d - offset)) / (width2 * width2));
+    return (d > offset) ? overshoot : 0.0;  // 只在后沿
+}
+
+// 简单的伪噪声函数（value-noise）
+float pseudoNoise(float x) {
+    // 简单的哈希函数
+    float f = sin(x * 12.9898) * 43758.5453;
+    return f - floor(f);  // 返回[0,1)
+}
+
+// 计算湍流层（空间相关噪声）
+float smoothNoise(float pos, float time, float n) {
+    float t = constrain(n / 100.0, 0.0, 1.0);
+    float k = smoothstep(0.0, 1.0, t);
+    
+    float freq = 0.8;  // 空间频率
+    float rate = lerpFloat(0.1, 1.5, k);  // 时间变化率
+    float amp = lerpFloat(0.0, 0.15, k);  // 幅度
+    
+    float noise = pseudoNoise(pos * freq + time * rate);
+    return (noise - 0.5) * amp;  // 中心化并缩放
+}
+
+// 更新事件层
+void updateEventLayer(ControlState* state, float deltaTime) {
+    float n = state->currentControlValue;
+    if (n < 70.0) {
+        state->eventIntensity = 0.0;
+        return;
+    }
+    
+    // 检查cooldown
+    unsigned long now = millis();
+    if (state->eventIntensity > 0.0) {
+        // 更新现有事件
+        state->eventPhase += deltaTime * 8.0;  // 快速扫过
+        if (state->eventPhase >= PHASE_PERIOD) {
+            state->eventIntensity = 0.0;
+        }
+    } else if (now - state->lastEventTime >= (unsigned long)(EVENT_COOLDOWN * 1000)) {
+        // 检查是否触发新事件
+        float t = (n - 70.0) / 30.0;
+        float rate = lerpFloat(0.05, 0.35, t);  // 每秒概率
+        if (randomFloat(0.0, 1.0) < rate * deltaTime) {
+            state->eventIntensity = 1.0;
+            state->eventPhase = 0.0;
+            state->lastEventTime = now;
+        }
+    }
+}
+
+// 计算事件层贡献
+float calculateEventContribution(float pos, ControlState* state) {
+    if (state->eventIntensity <= 0.0) return 0.0;
+    
+    float d = getCyclicDistance(pos, state->eventPhase, PHASE_PERIOD);
+    float width = 0.5;  // 窄暗带
+    float pulse = exp(-(d * d) / (width * width));
+    
+    return -state->eventIntensity * pulse * 0.6;  // 压暗
 }
 
 // 渲染功能A（间隔点亮）
@@ -761,9 +890,10 @@ void renderFunctionA(int groupIndex) {
     }
 }
 
-// 渲染功能B（虚拟位置系统）
+// 渲染功能B（多层冲突效果）
 void renderFunctionB(int groupIndex) {
-    uint8_t baseBrightnessB = mapControlToBrightnessB(state.currentControlValue);
+    float n = state.currentControlValue;
+    uint8_t baseBrightnessB = mapControlToBrightnessB(n);
     VirtualPosRange range = GROUP_VIRTUAL_MAP[groupIndex];
     int totalLeds = LEDS_PER_GROUP[groupIndex];
     
@@ -772,26 +902,74 @@ void renderFunctionB(int groupIndex) {
     int cEnd = (int)(totalLeds * 0.75);    // c = 75%
     int bSegmentLength = cEnd - bStart;
     
+    // 段边界不发光区域（每段开头结尾各3颗灯珠）
+    const int SEGMENT_BORDER_LEDS = 3;
+    
     for (int i = bStart; i < cEnd; i++) {
-        // 将灯珠索引映射到虚拟位置
+        // 将灯珠索引映射到虚拟位置（离散化）
         float localPos;
+        int segmentIndex = -1;  // 段索引，用于检测段边界
+        
         if (range.start == range.end) {
             // 单个虚拟位置（如组2显示位置1）
             localPos = range.start;
         } else {
-            // 多个虚拟位置范围（线性映射）
+            // 多个虚拟位置范围（离散化分段）
+            int count = (int)(range.end - range.start + 1);  // 虚拟位置数量
             float progress = (float)(i - bStart) / bSegmentLength;
-            localPos = range.start + (range.end - range.start) * progress;
+            int k = constrain((int)floor(progress * count), 0, count - 1);
+            localPos = range.start + k;
+            segmentIndex = k;  // 记录段索引
         }
         
-        // 计算到全局虚拟位置的距离（考虑循环）
-        float distance = getCyclicDistance(localPos, state.globalVirtualPos);
+        // 应用端点拉伸（只对端点组）
+        if (range.start == range.end && (range.start == 1.0 || range.start == 20.0)) {
+            localPos = calculateStretchedPos(localPos, n);
+        }
         
-        // 获取拖尾亮度
-        float trailBrightness = getTrailBrightness(distance);
+        // 检测是否在段边界（每段开头结尾各3颗灯珠不发光）
+        bool isSegmentBorder = false;
+        if (range.start != range.end && segmentIndex >= 0) {
+            // 计算当前LED在段内的相对位置
+            int count = (int)(range.end - range.start + 1);
+            float segmentSize = (float)bSegmentLength / count;  // 每段的LED数量
+            float segmentStart = segmentIndex * segmentSize;  // 当前段的起始位置（相对于bStart）
+            float posInSegment = (float)(i - bStart) - segmentStart;  // LED在段内的位置
+            
+            // 检查是否在段开头或结尾的3颗灯珠范围内
+            if (posInSegment < SEGMENT_BORDER_LEDS || posInSegment >= (segmentSize - SEGMENT_BORDER_LEDS)) {
+                isSegmentBorder = true;
+            }
+        }
         
-        // 应用亮度
-        uint8_t finalBrightness = (uint8_t)(baseBrightnessB * trailBrightness);
+        // 如果是在段边界，直接设为黑色并跳过后续计算
+        if (isSegmentBorder) {
+            leds[groupIndex][i] = CRGB::Black;
+            continue;
+        }
+        
+        // 1. 底色层
+        float brightness = (float)baseBrightnessB / 255.0;
+        
+        // 2. 主暗波层（高斯脉冲下陷）
+        float darkWave = calculateMainDarkWave(localPos, state.phase, n);
+        brightness *= (1.0 - darkWave);
+        
+        // 3. 回弹过冲层
+        float overshoot = calculateOvershoot(localPos, state.phase, n);
+        brightness += overshoot;
+        
+        // 4. 湍流层（空间相关噪声）
+        float turbulence = smoothNoise(localPos, state.globalTime, n);
+        brightness += turbulence;
+        
+        // 5. 事件层（冲击波/撕裂瞬变）
+        float event = calculateEventContribution(localPos, &state);
+        brightness += event;
+        
+        // 限制亮度范围并应用
+        brightness = constrain(brightness, 0.0, 1.0);
+        uint8_t finalBrightness = (uint8_t)(brightness * 255.0);
         leds[groupIndex][i] = CHSV(0, 255, finalBrightness); // 红色，HSV模式（色相0=红色）
     }
 }
@@ -808,8 +986,14 @@ void loop() {
         updateBrightnessTransition();
     }
     
-    // 3. 更新虚拟位置
+    // 3. 更新波相位和事件层
     updateVirtualPosition();
+    if (!state.isPaused) {
+        unsigned long currentTime = millis();
+        float deltaTime = (currentTime - state.lastUpdateTime) / 1000.0;
+        if (deltaTime > 1.0) deltaTime = 0.016;
+        updateEventLayer(&state, deltaTime);
+    }
     
     // 4. 渲染所有组（5组）
     for (int g = 0; g < NUM_GROUPS; g++) {
