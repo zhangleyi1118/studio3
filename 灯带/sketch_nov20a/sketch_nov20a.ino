@@ -29,6 +29,13 @@
 #define PI 3.14159265358979323846
 #endif
 
+// ================= 前向声明 =================
+struct Particle;
+struct TidalStripState;
+struct ControlState;
+struct Wave;
+struct VirtualPosRange;
+
 // ================= 配置区域 =================
 
 // 1. 灯带参数
@@ -60,6 +67,9 @@ const int LEDS_PER_GROUP[NUM_GROUPS] = {
 #define PHASE_SPEED_FAST 3.2    // 快速（虚拟位置单位/秒）
 #define EVENT_COOLDOWN   1.8    // 事件层冷却时间（秒）
 #define TRAIL_RANGE      2.0    // 拖尾前后各2个虚拟位置（保留用于兼容）
+#define MAX_WAVES        10     // 最大波数量（同时存在的波）
+#define WAVE_INTERVAL_SLOW 10.0  // n=0时波发送间隔（秒）
+#define WAVE_INTERVAL_FAST 1.0   // n=100时波发送间隔（秒）
 
 // 4. 亮度过渡参数
 #define TRANSITION_TIME_MS  16000  // 0→100需要16秒
@@ -137,6 +147,14 @@ CRGB leds[NUM_GROUPS][MAX_LEDS_PER_STRIP];
 CRGB leds_tidal1[TIDAL_STRIP_1_LEDS];
 CRGB leds_tidal2[TIDAL_STRIP_2_LEDS];
 
+// 波结构体
+struct Wave {
+    float phase;        // 当前相位 [0, 21)
+    float speed;        // 波速度（生成时的速度，保持不变）
+    float nValue;       // 生成时的n值（用于计算宽度和深度）
+    bool active;        // 是否激活
+};
+
 // 全局控制状态
 struct ControlState {
     float targetControlValue;    // 目标控制值 (0-100)
@@ -145,7 +163,11 @@ struct ControlState {
     float transitionStartValue;  // 过渡开始时的值
     bool isTransitioning;        // 是否正在过渡
     
-    float phase;                 // 波相位 [0, 21)，从0开始
+    // 波队列系统
+    Wave waves[MAX_WAVES];       // 波队列
+    int waveCount;               // 当前波数量
+    float lastWaveSpawnTime;     // 上次生成波的时间（秒）
+    
     bool isPaused;               // 是否暂停
     unsigned long lastUpdateTime; // 上次更新时间（用于计算deltaTime）
     
@@ -157,12 +179,13 @@ struct ControlState {
 };
 
 ControlState state = {
-    .targetControlValue = 0.0,
-    .currentControlValue = 0.0,
+    .targetControlValue = 100.0,  // 初始状态：整体都亮
+    .currentControlValue = 100.0,  // 初始状态：整体都亮
     .transitionStartTime = 0,
-    .transitionStartValue = 0.0,
+    .transitionStartValue = 100.0,
     .isTransitioning = false,
-    .phase = 0.0,                // 波从0开始
+    .waveCount = 0,
+    .lastWaveSpawnTime = 0.0,
     .isPaused = false,
     .lastUpdateTime = 0,
     .eventIntensity = 0.0,
@@ -170,6 +193,18 @@ ControlState state = {
     .lastEventTime = 0,
     .globalTime = 0.0
 };
+
+// 初始化波数组
+void initWaves() {
+    for (int i = 0; i < MAX_WAVES; i++) {
+        state.waves[i].phase = 0.0;
+        state.waves[i].speed = 0.0;
+        state.waves[i].nValue = 0.0;
+        state.waves[i].active = false;
+    }
+    state.waveCount = 0;
+    state.lastWaveSpawnTime = 0.0;
+}
 
 // 粒子结构体
 struct Particle {
@@ -592,9 +627,15 @@ void setup() {
     
     FastLED.setBrightness(MAX_BRIGHTNESS);
     FastLED.clear();
+    
+    // 初始状态：整体都亮（功能A和功能B都显示）
+    // 功能A和功能B会在loop中自动渲染，初始值为100.0
     FastLED.show();
     
     state.lastUpdateTime = millis();
+    
+    // 初始化波队列
+    initWaves();
     
     // 初始化潮汐桥时间基准（自主运行，默认值50）
     unsigned long now = millis();
@@ -639,12 +680,31 @@ void parseCommand(String cmd) {
             
             // 重置时间基准，确保速度立即改变（避免累积误差）
             state.lastUpdateTime = millis();
-            // 重置事件层状态（如果设置为0）
+            
+            // 当n值变化时，清空所有旧的波，让新波使用新的n值
             if (targetValue == 0) {
                 state.eventIntensity = 0.0;
                 state.eventPhase = 0.0;
                 state.lastEventTime = 0;
                 state.globalTime = 0.0;
+                // 清空所有波
+                for (int i = 0; i < MAX_WAVES; i++) {
+                    state.waves[i].active = false;
+                }
+                state.waveCount = 0;
+                state.lastWaveSpawnTime = 0.0;
+            } else {
+                // 当n值变化时（即使不是0），也应该清空旧的波
+                // 这样新生成的波会使用新的n值
+                // 但保留globalTime，让新波可以立即生成
+                for (int i = 0; i < MAX_WAVES; i++) {
+                    state.waves[i].active = false;
+                }
+                state.waveCount = 0;
+                // 修复：重置为当前时间减去一个间隔，避免立即生成多个波
+                float t = constrain(targetValue / 100.0, 0.0, 1.0);
+                float waveInterval = lerpFloat(WAVE_INTERVAL_SLOW, WAVE_INTERVAL_FAST, t);
+                state.lastWaveSpawnTime = state.globalTime - waveInterval;  // 改为减去间隔，而不是直接等于
             }
             
             // 同时更新潮汐桥的控制值（直接设置，不过渡）
@@ -723,7 +783,39 @@ void updateBrightnessTransition() {
     }
 }
 
-// 更新波相位
+// 生成新波（从0位置）
+void spawnWave(ControlState* state) {
+    if (state->waveCount >= MAX_WAVES) return;
+    
+    // 计算当前n值对应的速度（用于新波）
+    float n = state->targetControlValue;
+    float t = constrain(n / 100.0, 0.0, 1.0);
+    float k = smoothstep(0.0, 1.0, t);
+    float speed = lerpFloat(PHASE_SPEED_SLOW, PHASE_SPEED_FAST, k);
+    
+    // 找到空闲的波槽
+    for (int i = 0; i < MAX_WAVES; i++) {
+        if (!state->waves[i].active) {
+            state->waves[i].phase = 0.0;  // 从0位置开始
+            state->waves[i].speed = speed;  // 保存生成时的速度
+            state->waves[i].nValue = n;     // 保存生成时的n值
+            state->waves[i].active = true;
+            state->waveCount++;
+            
+            // 发送波生成信号到串口
+            Serial.print("WAVE_SPAWN n=");
+            Serial.print(n, 1);
+            Serial.print(" speed=");
+            Serial.print(speed, 2);
+            Serial.print(" phase=0.0");
+            Serial.println();
+            
+            break;
+        }
+    }
+}
+
+// 更新波队列
 void updateVirtualPosition() {
     if (state.isPaused) return;
     
@@ -746,10 +838,27 @@ void updateVirtualPosition() {
     // 速度计算：speed = lerp(slow, fast, k)
     float speed = lerpFloat(PHASE_SPEED_SLOW, PHASE_SPEED_FAST, k);
     
-    // 更新相位：[0, 21)
-    state.phase = fmod(state.phase + speed * deltaTime, PHASE_PERIOD);
-    if (state.phase < 0.0) {
-        state.phase += PHASE_PERIOD;
+    // 波发送间隔：n=0时10秒，n=100时1秒，中间均匀变化
+    float waveInterval = lerpFloat(WAVE_INTERVAL_SLOW, WAVE_INTERVAL_FAST, t);
+    
+    // 检查是否需要生成新波
+    if (state.globalTime - state.lastWaveSpawnTime >= waveInterval) {
+        spawnWave(&state);
+        state.lastWaveSpawnTime = state.globalTime;
+    }
+    
+    // 更新所有激活的波（每个波使用自己的速度）
+    for (int i = 0; i < MAX_WAVES; i++) {
+        if (state.waves[i].active) {
+            // 使用波自己的速度更新相位
+            state.waves[i].phase += state.waves[i].speed * deltaTime;
+            
+            // 如果波超出范围，移除它
+            if (state.waves[i].phase >= PHASE_PERIOD) {
+                state.waves[i].active = false;
+                state.waveCount--;
+            }
+        }
     }
 }
 
@@ -770,35 +879,98 @@ float calculateStretchedPos(float basePos, float n) {
     return basePos;  // 其他位置不变
 }
 
-// 计算主暗波（高斯脉冲下陷）
-float calculateMainDarkWave(float pos, float phase, float n) {
+// 计算单个波对虚拟位置的贡献（前20%渐暗，后20%渐亮效果）
+float calculateSingleWaveContribution(float pos, float wavePhase, float n) {
     float t = constrain(n / 100.0, 0.0, 1.0);
-    float k = smoothstep(0.0, 1.0, t);  // 或 t*t
+    float k = smoothstep(0.0, 1.0, t);
     
-    // 计算循环距离
-    float d = getCyclicDistance(pos, phase, PHASE_PERIOD);
+    // 计算直接距离和方向
+    float d = pos - wavePhase;  // 有正负：正数表示在波后，负数表示在波前
+    float absD = fabs(d);
     
     // 波宽和深度随n变化
     float width = lerpFloat(1.5, 0.8, k);  // n大时更窄
     float depth = lerpFloat(0.3, 0.85, k);   // n大时更深
     
-    // 高斯脉冲下陷
-    float pulse = exp(-(d * d) / (width * width));
-    return depth * pulse;
+    // 如果距离超过波宽，认为波已经走过了，贡献为0
+    if (absD > width) {
+        return 0.0;
+    }
+    
+    // 前20%渐暗，后20%渐亮，中间60%保持最暗
+    float frontWidth = width * 0.2;  // 前20%的宽度
+    float backWidth = width * 0.2;   // 后20%的宽度
+    
+    if (d < 0) {
+        // 波前（pos < wavePhase）
+        if (absD <= frontWidth) {
+            // 前20%：从0渐暗到depth
+            float t_front = absD / frontWidth;  // 0到1
+            float smooth = smoothstep(0.0, 1.0, t_front);
+            return depth * smooth;
+        } else {
+            // 中间60%：保持最暗
+            return depth;
+        }
+    } else {
+        // 波后（pos > wavePhase）
+        if (absD <= backWidth) {
+            // 后20%：从depth渐亮到0
+            float t_back = absD / backWidth;  // 0到1
+            float smooth = smoothstep(0.0, 1.0, t_back);
+            return depth * (1.0 - smooth);  // 从depth到0
+        } else {
+            // 超过后20%，贡献为0
+            return 0.0;
+        }
+    }
 }
 
-// 计算回弹过冲效果
-float calculateOvershoot(float pos, float phase, float n) {
-    float t = constrain(n / 100.0, 0.0, 1.0);
-    float k = smoothstep(0.0, 1.0, t);
+// 计算主暗波（所有波的叠加）
+float calculateMainDarkWave(float pos, ControlState* state, float n) {
+    float totalDarkWave = 0.0;
     
-    float d = getCyclicDistance(pos, phase, PHASE_PERIOD);
+    // 遍历所有激活的波，计算叠加效果
+    for (int i = 0; i < MAX_WAVES; i++) {
+        if (state->waves[i].active) {
+            // 使用波生成时的n值来计算宽度和深度
+            float contribution = calculateSingleWaveContribution(pos, state->waves[i].phase, state->waves[i].nValue);
+            // 叠加所有波的贡献（取最大值，避免过度叠加）
+            totalDarkWave = max(totalDarkWave, contribution);
+        }
+    }
+    
+    return totalDarkWave;
+}
+
+// 计算回弹过冲效果（所有波的叠加）
+float calculateOvershoot(float pos, ControlState* state, float n) {
     float offset = 0.4;  // 回弹位置偏移
     float width2 = 0.6;
-    float gain = lerpFloat(0.05, 0.25, k);
     
-    float overshoot = gain * exp(-((d - offset) * (d - offset)) / (width2 * width2));
-    return (d > offset) ? overshoot : 0.0;  // 只在后沿
+    float totalOvershoot = 0.0;
+    
+    // 遍历所有激活的波
+    for (int i = 0; i < MAX_WAVES; i++) {
+        if (state->waves[i].active) {
+            // 使用波生成时的n值来计算回弹增益
+            float t = constrain(state->waves[i].nValue / 100.0, 0.0, 1.0);
+            float k = smoothstep(0.0, 1.0, t);
+            float gain = lerpFloat(0.05, 0.25, k);
+            
+            // 计算直接距离（不使用循环距离）
+            float d = fabs(pos - state->waves[i].phase);
+            
+            // 限制overshoot的有效范围：只在波后沿的一定范围内有效
+            // 如果距离超过 offset + width2*3，认为波已经走过了，overshoot为0
+            if (d > offset && d < offset + width2 * 3.0) {
+                float overshoot = gain * exp(-((d - offset) * (d - offset)) / (width2 * width2));
+                totalOvershoot = max(totalOvershoot, overshoot);  // 取最大值
+            }
+        }
+    }
+    
+    return totalOvershoot;
 }
 
 // 简单的伪噪声函数（value-noise）
@@ -951,12 +1123,12 @@ void renderFunctionB(int groupIndex) {
         // 1. 底色层
         float brightness = (float)baseBrightnessB / 255.0;
         
-        // 2. 主暗波层（高斯脉冲下陷）
-        float darkWave = calculateMainDarkWave(localPos, state.phase, n);
+        // 2. 主暗波层（高斯脉冲下陷，所有波的叠加）
+        float darkWave = calculateMainDarkWave(localPos, &state, n);
         brightness *= (1.0 - darkWave);
         
-        // 3. 回弹过冲层
-        float overshoot = calculateOvershoot(localPos, state.phase, n);
+        // 3. 回弹过冲层（所有波的叠加）
+        float overshoot = calculateOvershoot(localPos, &state, n);
         brightness += overshoot;
         
         // 4. 湍流层（空间相关噪声）

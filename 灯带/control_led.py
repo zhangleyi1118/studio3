@@ -7,6 +7,8 @@ LED灯带控制系统 - Python控制脚本
 import serial
 import serial.tools.list_ports
 import time
+import threading
+import queue
 
 def list_available_ports():
     """列出所有可用的串口"""
@@ -124,19 +126,75 @@ def main():
     
     print_help()
     
-    try:
+    import threading
+    import queue
+    
+    # 创建一个队列用于存储串口消息
+    message_queue = queue.Queue()
+    input_queue = queue.Queue()
+    
+    # 串口读取线程
+    def read_serial():
         while True:
-            # 读取设备的反馈消息
-            while ser.in_waiting:
-                msg = ser.readline().decode('utf-8', errors='ignore').strip()
-                if msg:
-                    print(f"设备: {msg}")
-            
-            # 获取用户输入
+            try:
+                if ser.in_waiting:
+                    msg = ser.readline().decode('utf-8', errors='ignore').strip()
+                    if msg:
+                        message_queue.put(msg)
+                else:
+                    time.sleep(0.01)  # 短暂休眠，避免CPU占用过高
+            except:
+                break
+    
+    # 用户输入线程
+    def read_input():
+        while True:
             try:
                 command = input("\n输入指令: ").strip()
+                input_queue.put(command)
             except (EOFError, KeyboardInterrupt):
+                input_queue.put(None)  # 发送退出信号
                 break
+    
+    # 启动串口读取线程
+    serial_thread = threading.Thread(target=read_serial, daemon=True)
+    serial_thread.start()
+    
+    # 启动用户输入线程
+    input_thread = threading.Thread(target=read_input, daemon=True)
+    input_thread.start()
+    
+    try:
+        while True:
+            # 优先处理串口消息（实时输出）
+            while not message_queue.empty():
+                msg = message_queue.get()
+                # 检查是否是波生成信号
+                if msg.startswith("WAVE_SPAWN"):
+                    # 解析波生成信息
+                    parts = msg.split()
+                    wave_info = {}
+                    for part in parts[1:]:  # 跳过 "WAVE_SPAWN"
+                        if '=' in part:
+                            key, value = part.split('=')
+                            wave_info[key] = value
+                    
+                    # 格式化输出波生成日志
+                    n_val = wave_info.get('n', '?')
+                    speed_val = wave_info.get('speed', '?')
+                    phase_val = wave_info.get('phase', '?')
+                    print(f"🌊 [波生成] n={n_val}, 速度={speed_val}, 相位={phase_val}", flush=True)
+                else:
+                    print(f"设备: {msg}", flush=True)
+            
+            # 检查用户输入（非阻塞）
+            try:
+                command = input_queue.get_nowait()
+                if command is None:  # 退出信号
+                    break
+            except queue.Empty:
+                time.sleep(0.01)  # 短暂休眠
+                continue
             
             if not command:
                 continue
@@ -174,18 +232,10 @@ def main():
             # 发送命令到设备（加换行便于解析）
             try:
                 ser.write((command + "\n").encode())
-                print(f"✓ 已发送指令: {command}")
-                time.sleep(0.2)  # 等待设备响应
-                
-                # 立即读取设备返回
-                response_count = 0
-                while ser.in_waiting and response_count < 10:
-                    msg = ser.readline().decode('utf-8', errors='ignore').strip()
-                    if msg:
-                        print(f"  ← {msg}")
-                        response_count += 1
+                print(f"✓ 已发送指令: {command}", flush=True)
+                time.sleep(0.1)  # 短暂等待设备响应
             except Exception as e:
-                print(f"错误：发送命令失败 - {e}")
+                print(f"错误：发送命令失败 - {e}", flush=True)
     
     except KeyboardInterrupt:
         print("\n\n检测到 Ctrl+C，正在退出...")
